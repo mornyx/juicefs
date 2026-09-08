@@ -421,12 +421,19 @@ type drive9ReadResp struct {
 	Slices []byte `json:"slices"`
 }
 
+// WritePart is one slice in a Flush-time batch (one HTTP, one TiDB txn).
+type WritePart struct {
+	Off   uint32 `json:"off"`
+	Slice Slice  `json:"slice"`
+}
+
 type drive9WriteReq struct {
-	Inode Ino       `json:"inode"`
-	Indx  uint32    `json:"indx"`
-	Off   uint32    `json:"off"`
-	Slice Slice     `json:"slice"`
-	Mtime time.Time `json:"mtime"`
+	Inode Ino         `json:"inode"`
+	Indx  uint32      `json:"indx"`
+	Off   uint32      `json:"off"`
+	Slice Slice       `json:"slice"`
+	Parts []WritePart `json:"parts,omitempty"`
+	Mtime time.Time   `json:"mtime"`
 }
 
 type drive9WriteResp struct {

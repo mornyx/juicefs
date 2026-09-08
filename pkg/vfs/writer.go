@@ -183,6 +183,10 @@ func (c *chunkWriter) findWritableSlice(pos uint32, size uint32) *sliceWriter {
 	return nil
 }
 
+type metaWriteParts interface {
+	WriteParts(ctx meta.Context, inode Ino, indx uint32, parts []meta.WritePart, mtime time.Time) syscall.Errno
+}
+
 func (c *chunkWriter) commitThread() {
 	f := c.file
 	defer f.w.free(f)
@@ -200,21 +204,78 @@ func (c *chunkWriter) commitThread() {
 		for s.dep != nil && !s.dep.committed {
 			f.commitcond.WaitWithTimeout(time.Millisecond * 100)
 		}
+		ncommit := 1
+		if f.flushwaiting > 0 {
+			for {
+				ready := true
+				for _, x := range c.slices {
+					if !x.done {
+						ready = false
+						break
+					}
+				}
+				if ready {
+					ncommit = len(c.slices)
+					break
+				}
+				f.commitcond.WaitWithTimeout(time.Millisecond * 10)
+			}
+		}
 		err := s.err
+		for i := 0; i < ncommit; i++ {
+			if c.slices[i].err != 0 {
+				err = c.slices[i].err
+				ncommit = i
+				break
+			}
+			if c.slices[i].dep != nil && !c.slices[i].dep.committed {
+				ncommit = i
+				break
+			}
+		}
+		if ncommit < 1 {
+			ncommit = 1
+		}
+		items := append([]*sliceWriter(nil), c.slices[:ncommit]...)
 		f.Unlock()
 
 		if err == 0 {
-			var ss = meta.Slice{Id: s.id, Size: s.length, Off: s.soff, Len: s.slen}
-			err = f.w.m.Write(meta.Background(), f.inode, c.indx, s.off, ss, s.lastMod)
-			f.w.reader.Invalidate(f.inode, uint64(c.indx)*meta.ChunkSize+uint64(s.off), uint64(ss.Len))
+			if ncommit > 1 {
+				if bw, ok := f.w.m.(metaWriteParts); ok {
+					parts := make([]meta.WritePart, ncommit)
+					var lastMod time.Time
+					for i, it := range items {
+						parts[i] = meta.WritePart{Off: it.off, Slice: meta.Slice{Id: it.id, Size: it.length, Off: it.soff, Len: it.slen}}
+						if it.lastMod.After(lastMod) {
+							lastMod = it.lastMod
+						}
+					}
+					err = bw.WriteParts(meta.Background(), f.inode, c.indx, parts, lastMod)
+					for _, it := range items {
+						f.w.reader.Invalidate(f.inode, uint64(c.indx)*meta.ChunkSize+uint64(it.off), uint64(it.slen))
+					}
+				} else {
+					ncommit = 1
+					items = items[:1]
+				}
+			}
+			if ncommit == 1 && err == 0 {
+				it := items[0]
+				ss := meta.Slice{Id: it.id, Size: it.length, Off: it.soff, Len: it.slen}
+				err = f.w.m.Write(meta.Background(), f.inode, c.indx, it.off, ss, it.lastMod)
+				f.w.reader.Invalidate(f.inode, uint64(c.indx)*meta.ChunkSize+uint64(it.off), uint64(ss.Len))
+			}
 		}
 
 		f.Lock()
 		if err != 0 {
 			if err == syscall.ENOENT || err == syscall.ENOSPC || err == syscall.EDQUOT {
-				go func(id uint64, length int) {
-					_ = f.w.store.Remove(id, length)
-				}(s.id, int(s.length))
+				for _, it := range items {
+					id, length := it.id, int(it.length)
+					go func(id uint64, length int) {
+						_ = f.w.store.Remove(id, length)
+					}(id, length)
+				}
 			} else {
 				logger.Warnf("write inode:%d error: %s", f.inode, err)
 				err = syscall.EIO
@@ -222,11 +283,13 @@ func (c *chunkWriter) commitThread() {
 			f.err = err
 			logger.Errorf("write inode:%d indx:%d %s", f.inode, c.indx, err)
 		}
-		s.committed = true
-		if s.growing {
-			f.commitcond.Broadcast()
+		for i := 0; i < ncommit && i < len(c.slices); i++ {
+			c.slices[i].committed = true
+			if c.slices[i].growing {
+				f.commitcond.Broadcast()
+			}
 		}
-		c.slices = c.slices[1:]
+		c.slices = c.slices[ncommit:]
 	}
 	f.freeChunk(c)
 	f.Unlock()

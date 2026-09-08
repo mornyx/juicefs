@@ -332,14 +332,52 @@ func (m *drive9Meta) doList(ctx Context, inode Ino) ([]*slice, syscall.Errno) {
 }
 
 func (m *drive9Meta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
+	return m.writeParts(ctx, inode, indx, []WritePart{{Off: off, Slice: slice}}, mtime, numSlices, delta, attr)
+}
+
+// WriteParts commits many slices of one chunk in a single HTTP meta RPC.
+// Used by VFS commitThread during Flush/Fsync so a WAL checkpoint is not
+// one TiDB txn per 4KiB page.
+func (m *drive9Meta) WriteParts(ctx Context, inode Ino, indx uint32, parts []WritePart, mtime time.Time) syscall.Errno {
+	if len(parts) == 0 {
+		return 0
+	}
+	f := m.of.find(inode)
+	if f != nil {
+		f.Lock()
+		defer f.Unlock()
+	}
+	defer func() { m.of.InvalidateChunk(inode, indx) }()
+	var numSlices int
+	var delta dirStat
+	var attr Attr
+	st := m.writeParts(ctx, inode, indx, parts, mtime, &numSlices, &delta, &attr)
+	if st == 0 {
+		m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
+		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
+		if numSlices%100 == 99 || numSlices > 350 {
+			if numSlices < maxSlices {
+				go m.compactChunk(inode, indx, false, false, int(attr.Tier))
+			} else {
+				m.compactChunk(inode, indx, true, false, int(attr.Tier))
+			}
+		}
+	}
+	return st
+}
+
+func (m *drive9Meta) writeParts(ctx Context, inode Ino, indx uint32, parts []WritePart, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
+	if len(parts) == 0 {
+		return 0
+	}
+	req := &drive9WriteReq{Inode: inode, Indx: indx, Mtime: mtime, Parts: parts}
+	if len(parts) == 1 {
+		req.Off = parts[0].Off
+		req.Slice = parts[0].Slice
+		req.Parts = nil
+	}
 	var resp drive9WriteResp
-	st := m.call(ctx, Drive9OpWrite, &drive9WriteReq{
-		Inode: inode,
-		Indx:  indx,
-		Off:   off,
-		Slice: slice,
-		Mtime: mtime,
-	}, &resp)
+	st := m.call(ctx, Drive9OpWrite, req, &resp)
 	if st = respErrno(resp.Errno, st); st != 0 {
 		return st
 	}
