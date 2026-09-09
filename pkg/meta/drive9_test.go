@@ -131,6 +131,16 @@ func (t *memTransport) Call(ctx Context, op string, req, resp any) syscall.Errno
 		}
 		t.nodes[in.Inode] = &attr
 		t.edges[edgeKey(in.Parent, in.Name)] = in.Inode
+		for _, p := range in.Parts {
+			key := in.Inode.String() + ":" + itoa(in.Indx)
+			buf := marshalSlice(p.Off, p.Slice.Id, p.Slice.Size, p.Slice.Off, p.Slice.Len)
+			t.chunks[key] = append(t.chunks[key], buf...)
+			newlen := uint64(in.Indx)*ChunkSize + uint64(p.Off) + uint64(p.Slice.Len)
+			if newlen > attr.Length {
+				attr.Length = newlen
+			}
+		}
+		t.nodes[in.Inode] = &attr
 		cp := attr
 		return encodeResp(resp, &drive9NodeResp{Inode: in.Inode, Attr: &cp})
 	case Drive9OpUnlink:
@@ -166,19 +176,26 @@ func (t *memTransport) Call(ctx Context, op string, req, resp any) syscall.Errno
 			return encodeResp(resp, &drive9WriteResp{Errno: int(syscall.ENOENT)})
 		}
 		key := in.Inode.String() + ":" + itoa(in.Indx)
-		buf := marshalSlice(in.Off, in.Slice.Id, in.Slice.Size, in.Slice.Off, in.Slice.Len)
-		t.chunks[key] = append(t.chunks[key], buf...)
-		newlen := uint64(in.Indx)*ChunkSize + uint64(in.Off) + uint64(in.Slice.Len)
-		delta := int64(0)
-		if newlen > attr.Length {
-			delta = int64(newlen - attr.Length)
-			attr.Length = newlen
+		parts := in.Parts
+		if len(parts) == 0 {
+			parts = []WritePart{{Off: in.Off, Slice: in.Slice}}
+		}
+		var delta int64
+		for _, p := range parts {
+			buf := marshalSlice(p.Off, p.Slice.Id, p.Slice.Size, p.Slice.Off, p.Slice.Len)
+			t.chunks[key] = append(t.chunks[key], buf...)
+			newlen := uint64(in.Indx)*ChunkSize + uint64(p.Off) + uint64(p.Slice.Len)
+			if newlen > attr.Length {
+				delta += int64(newlen - attr.Length)
+				attr.Length = newlen
+			}
 		}
 		cp := *attr
 		return encodeResp(resp, &drive9WriteResp{
 			NumSlices: len(t.chunks[key]) / sliceBytes,
 			Attr:      &cp,
 			Length:    delta,
+			Space:     delta,
 		})
 	default:
 		return encodeResp(resp, &drive9ErrnoResp{})
@@ -260,6 +277,89 @@ func TestDrive9MetaCreateLookupUnlink(t *testing.T) {
 	}
 }
 
+type countingTransport struct {
+	Drive9Transport
+	n map[string]int
+}
+
+func (c *countingTransport) Call(ctx Context, op string, req, resp any) syscall.Errno {
+	if c.n == nil {
+		c.n = map[string]int{}
+	}
+	c.n[op]++
+	return c.Drive9Transport.Call(ctx, op, req, resp)
+}
+
+func TestDrive9UnlinkOpenedKeyOneRPC(t *testing.T) {
+	inner := newMemTransport()
+	tr := &countingTransport{Drive9Transport: inner, n: map[string]int{}}
+	conf := DefaultConf()
+	conf.NoBGJob = true
+	conf.MaxDeletes = 0
+	m := NewDrive9Meta(conf, tr)
+	ctx := NewContext(1, 1, []uint32{1}).WithValue(Drive9PathKey, "/j.db-journal")
+	format := &Format{Name: "drive9", UUID: "test", Storage: "file", BlockSize: 4 << 20, TrashDays: 0}
+	if err := m.Init(format, true); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if _, err := m.Load(false); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	var ino Ino
+	var attr Attr
+	if st := m.Create(ctx, RootInode, "j.db-journal", 0644, 0, syscall.O_EXCL, &ino, &attr); st != 0 {
+		t.Fatalf("create: %v", st)
+	}
+	tr.n = map[string]int{}
+	ctx = ctx.WithValue(Drive9OpenedKey, false)
+	if st := m.Unlink(ctx, RootInode, "j.db-journal"); st != 0 {
+		t.Fatalf("unlink: %v", st)
+	}
+	if tr.n[Drive9OpLookup] != 0 {
+		t.Fatalf("unlink Lookup RPCs=%d, want 0 when Drive9OpenedKey is set (JuiceFS sql IsOpen is same txn)", tr.n[Drive9OpLookup])
+	}
+	if tr.n[Drive9OpUnlink] != 1 {
+		t.Fatalf("unlink HTTP=%d, want 1 (JuiceFS sql_unlink is one txn; Drive9OpenedKey skips extra Lookup)", tr.n[Drive9OpUnlink])
+	}
+}
+
+func TestDrive9CreateWriteOneHTTP(t *testing.T) {
+	inner := newMemTransport()
+	tr := &countingTransport{Drive9Transport: inner, n: map[string]int{}}
+	conf := DefaultConf()
+	conf.NoBGJob = true
+	conf.MaxDeletes = 0
+	m := NewDrive9Meta(conf, tr)
+	d9 := m.(*drive9Meta)
+	ctx := NewContext(1, 1, []uint32{1}).WithValue(Drive9PathKey, "/j.db-journal")
+	if err := m.Init(&Format{Name: "drive9", UUID: "test", Storage: "file", BlockSize: 4 << 20, TrashDays: 0}, true); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	tr.n = map[string]int{}
+	var ino Ino
+	var attr Attr
+	if st := m.Create(ctx, RootInode, "j.db-journal", 0644, 0, syscall.O_EXCL, &ino, &attr); st != 0 {
+		t.Fatalf("create: %v", st)
+	}
+	if tr.n[Drive9OpMknod] != 1 {
+		t.Fatalf("create mknod HTTP=%d, want 1 (JuiceFS doMknod is a real insert before Create returns)", tr.n[Drive9OpMknod])
+	}
+	var got Ino
+	if st := m.Lookup(ctx, RootInode, "j.db-journal", &got, &attr, false); st != 0 || got != ino {
+		t.Fatalf("lookup: st=%v ino=%d", st, got)
+	}
+	var id uint64
+	if st := m.NewSlice(ctx, &id); st != 0 {
+		t.Fatalf("newslice: %v", st)
+	}
+	if st := d9.WriteParts(ctx, ino, 0, []WritePart{{Off: 0, Slice: Slice{Id: id, Size: 4, Len: 4}}}, time.Now()); st != 0 {
+		t.Fatalf("write: %v", st)
+	}
+	if tr.n[Drive9OpMknod] != 1 || tr.n[Drive9OpWrite] != 1 {
+		t.Fatalf("create+write mknod=%d write=%d, want 1+1 (JuiceFS create txn then write txn)", tr.n[Drive9OpMknod], tr.n[Drive9OpWrite])
+	}
+}
+
 func TestDrive9MetaWriteRead(t *testing.T) {
 	tr := newMemTransport()
 	conf := DefaultConf()
@@ -305,3 +405,312 @@ func TestDrive9MetaWriteRead(t *testing.T) {
 		t.Fatalf("slices = %+v, missing id=%d", slices, id)
 	}
 }
+
+func TestDrive9WriteDoesNotInlineCompact(t *testing.T) {
+	inner := newMemTransport()
+	tr := &countingTransport{Drive9Transport: inner, n: map[string]int{}}
+	conf := DefaultConf()
+	conf.NoBGJob = true
+	conf.MaxDeletes = 0
+	m := NewDrive9Meta(conf, tr)
+	ctx := NewContext(1, 1, []uint32{1})
+	if err := m.Init(&Format{Name: "drive9", UUID: "test", Storage: "file", BlockSize: 4 << 20}, true); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	var ino Ino
+	var attr Attr
+	if st := m.Create(ctx, RootInode, "blob", 0644, 0, 0, &ino, &attr); st != 0 {
+		t.Fatalf("create: %v", st)
+	}
+	if st := m.Open(ctx, ino, syscall.O_RDWR, &attr); st != 0 {
+		t.Fatalf("open: %v", st)
+	}
+	tr.n = map[string]int{}
+	parts := make([]WritePart, 400)
+	for i := range parts {
+		var id uint64
+		if st := m.NewSlice(ctx, &id); st != 0 {
+			t.Fatalf("newslice: %v", st)
+		}
+		parts[i] = WritePart{Off: uint32(i * 4), Slice: Slice{Id: id, Size: 4, Len: 4}}
+	}
+	d9, ok := m.(*drive9Meta)
+	if !ok {
+		t.Fatal("NewDrive9Meta must return *drive9Meta")
+	}
+	if st := d9.WriteParts(ctx, ino, 0, parts, time.Now()); st != 0 {
+		t.Fatalf("WriteParts: %v", st)
+	}
+	if tr.n[Drive9OpCompact] != 0 {
+		t.Fatalf("inline compact RPCs=%d, want 0 (NoBGJob: compact is claim_compact)", tr.n[Drive9OpCompact])
+	}
+	if tr.n[Drive9OpWrite] != 1 {
+		t.Fatalf("WriteParts HTTP write=%d, want 1 (one JuiceFS-shaped write txn)", tr.n[Drive9OpWrite])
+	}
+}
+
+func TestDrive9ReadDoesNotInlineCompact(t *testing.T) {
+	inner := newMemTransport()
+	tr := &countingTransport{Drive9Transport: inner, n: map[string]int{}}
+	conf := DefaultConf()
+	conf.NoBGJob = true
+	conf.MaxDeletes = 0
+	m := NewDrive9Meta(conf, tr)
+	ctx := NewContext(1, 1, []uint32{1})
+	if err := m.Init(&Format{Name: "drive9", UUID: "test", Storage: "file", BlockSize: 4 << 20}, true); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	var ino Ino
+	var attr Attr
+	if st := m.Create(ctx, RootInode, "blob", 0644, 0, 0, &ino, &attr); st != 0 {
+		t.Fatalf("create: %v", st)
+	}
+	if st := m.Open(ctx, ino, syscall.O_RDWR, &attr); st != 0 {
+		t.Fatalf("open: %v", st)
+	}
+	for i := 0; i < 6; i++ {
+		var id uint64
+		if st := m.NewSlice(ctx, &id); st != 0 {
+			t.Fatalf("newslice: %v", st)
+		}
+		sl := Slice{Id: id, Size: 4, Off: 0, Len: 4}
+		if st := m.Write(ctx, ino, 0, uint32(i*4), sl, time.Now()); st != 0 {
+			t.Fatalf("write %d: %v", i, st)
+		}
+	}
+	tr.n = map[string]int{}
+	var slices []Slice
+	if st := m.Read(ctx, ino, 0, &slices); st != 0 {
+		t.Fatalf("read: %v", st)
+	}
+	if len(slices) < 5 {
+		t.Fatalf("slices=%d, want ≥5 so JuiceFS SQL Read would compact", len(slices))
+	}
+	time.Sleep(20 * time.Millisecond)
+	if tr.n[Drive9OpCompact] != 0 {
+		t.Fatalf("Read compact RPCs=%d, want 0 (NoBGJob: compact is claim_compact)", tr.n[Drive9OpCompact])
+	}
+}
+
+type delayWriteTransport struct {
+	Drive9Transport
+	d time.Duration
+}
+
+func (d *delayWriteTransport) Call(ctx Context, op string, req, resp any) syscall.Errno {
+	if op == Drive9OpWrite || op == Drive9OpMknod {
+		time.Sleep(d.d)
+	}
+	return d.Drive9Transport.Call(ctx, op, req, resp)
+}
+
+func TestDrive9FlushDoesNotWaitOtherInodeQueue(t *testing.T) {
+	inner := newMemTransport()
+	tr := &delayWriteTransport{Drive9Transport: inner, d: 120 * time.Millisecond}
+	conf := DefaultConf()
+	conf.NoBGJob = true
+	conf.MaxDeletes = 0
+	m := NewDrive9Meta(conf, tr)
+	d9, ok := m.(*drive9Meta)
+	if !ok {
+		t.Fatal("NewDrive9Meta must return *drive9Meta")
+	}
+	ctx := NewContext(1, 1, []uint32{1})
+	if err := m.Init(&Format{Name: "drive9", UUID: "test", Storage: "file", BlockSize: 4 << 20}, true); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	var a, b Ino
+	var attr Attr
+	if st := m.Create(ctx, RootInode, "a.db", 0644, 0, 0, &a, &attr); st != 0 {
+		t.Fatalf("create a: %v", st)
+	}
+	if st := m.Create(ctx, RootInode, "b.db", 0644, 0, 0, &b, &attr); st != 0 {
+		t.Fatalf("create b: %v", st)
+	}
+	if st := m.Open(ctx, a, syscall.O_RDWR, &attr); st != 0 {
+		t.Fatalf("open a: %v", st)
+	}
+	if st := m.Open(ctx, b, syscall.O_RDWR, &attr); st != 0 {
+		t.Fatalf("open b: %v", st)
+	}
+	var ida, idb uint64
+	if st := m.NewSlice(ctx, &ida); st != 0 {
+		t.Fatalf("newslice a: %v", st)
+	}
+	if st := m.NewSlice(ctx, &idb); st != 0 {
+		t.Fatalf("newslice b: %v", st)
+	}
+	if st := d9.QueueWriteParts(ctx, a, 0, []WritePart{{Off: 0, Slice: Slice{Id: ida, Size: 4, Len: 4}}}, time.Now()); st != 0 {
+		t.Fatalf("queue a: %v", st)
+	}
+	start := time.Now()
+	if st := d9.WriteParts(ctx, b, 0, []WritePart{{Off: 0, Slice: Slice{Id: idb, Size: 4, Len: 4}}}, time.Now()); st != 0 {
+		t.Fatalf("flush b: %v", st)
+	}
+	elapsed := time.Since(start)
+	if elapsed >= 200*time.Millisecond {
+		t.Fatalf("Flush inode B waited %s; global FIFO serializes inodes (JuiceFS commitThread is per file)", elapsed)
+	}
+	if elapsed < 80*time.Millisecond {
+		t.Fatalf("write HTTP delay not applied: %s", elapsed)
+	}
+}
+
+func TestDrive9WaitWritesDrainsSameInodeQueue(t *testing.T) {
+	inner := newMemTransport()
+	tr := &delayWriteTransport{Drive9Transport: inner, d: 120 * time.Millisecond}
+	conf := DefaultConf()
+	conf.NoBGJob = true
+	conf.MaxDeletes = 0
+	m := NewDrive9Meta(conf, tr)
+	d9 := m.(*drive9Meta)
+	ctx := NewContext(1, 1, []uint32{1})
+	if err := m.Init(&Format{Name: "drive9", UUID: "test", Storage: "file", BlockSize: 4 << 20}, true); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	var ino Ino
+	var attr Attr
+	if st := m.Create(ctx, RootInode, "a.db", 0644, 0, 0, &ino, &attr); st != 0 {
+		t.Fatalf("create: %v", st)
+	}
+	if st := m.Open(ctx, ino, syscall.O_RDWR, &attr); st != 0 {
+		t.Fatalf("open: %v", st)
+	}
+	var id uint64
+	if st := m.NewSlice(ctx, &id); st != 0 {
+		t.Fatalf("newslice: %v", st)
+	}
+	if st := d9.QueueWriteParts(ctx, ino, 0, []WritePart{{Off: 0, Slice: Slice{Id: id, Size: 4, Len: 4}}}, time.Now()); st != 0 {
+		t.Fatalf("queue: %v", st)
+	}
+	start := time.Now()
+	if st := d9.WaitWrites(ino); st != 0 {
+		t.Fatalf("WaitWrites: %v", st)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 80*time.Millisecond {
+		t.Fatalf("WaitWrites returned in %s, want to drain the 120ms write", elapsed)
+	}
+}
+
+func TestDrive9QueueWritePartsBatchesHTTP(t *testing.T) {
+	inner := newMemTransport()
+	tr := &countingTransport{Drive9Transport: inner, n: map[string]int{}}
+	conf := DefaultConf()
+	conf.NoBGJob = true
+	conf.MaxDeletes = 0
+	m := NewDrive9Meta(conf, tr)
+	d9, ok := m.(*drive9Meta)
+	if !ok {
+		t.Fatal("NewDrive9Meta must return *drive9Meta")
+	}
+	ctx := NewContext(1, 1, []uint32{1})
+	if err := m.Init(&Format{Name: "drive9", UUID: "test", Storage: "file", BlockSize: 4 << 20}, true); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	var ino Ino
+	var attr Attr
+	if st := m.Create(ctx, RootInode, "blob", 0644, 0, 0, &ino, &attr); st != 0 {
+		t.Fatalf("create: %v", st)
+	}
+	if st := m.Open(ctx, ino, syscall.O_RDWR, &attr); st != 0 {
+		t.Fatalf("open: %v", st)
+	}
+	tr.n = map[string]int{}
+	for i := 0; i < 16; i++ {
+		var id uint64
+		if st := m.NewSlice(ctx, &id); st != 0 {
+			t.Fatalf("newslice: %v", st)
+		}
+		parts := []WritePart{{Off: uint32(i * 4), Slice: Slice{Id: id, Size: 4, Len: 4}}}
+		if st := d9.QueueWriteParts(ctx, ino, 0, parts, time.Now()); st != 0 {
+			t.Fatalf("queue %d: %v", i, st)
+		}
+	}
+	var id uint64
+	if st := m.NewSlice(ctx, &id); st != 0 {
+		t.Fatalf("newslice: %v", st)
+	}
+	if st := d9.WriteParts(ctx, ino, 0, []WritePart{{Off: 64, Slice: Slice{Id: id, Size: 4, Len: 4}}}, time.Now()); st != 0 {
+		t.Fatalf("flush write: %v", st)
+	}
+	httpN := tr.n[Drive9OpWrite] + tr.n[Drive9OpMknod]
+	if httpN == 0 {
+		t.Fatal("expected at least one HTTP write after WriteParts wait")
+	}
+	if httpN >= 16 {
+		t.Fatalf("HTTP writes=%d, want <16 (queued slices batched)", httpN)
+	}
+}
+
+func TestDrive9WritePartsCompactsAtMaxSlices(t *testing.T) {
+	inner := newMemTransport()
+	tr := &countingTransport{Drive9Transport: inner, n: map[string]int{}}
+	conf := DefaultConf()
+	conf.NoBGJob = true
+	conf.MaxDeletes = 0
+	m := NewDrive9Meta(conf, tr)
+	ctx := NewContext(1, 1, []uint32{1})
+	if err := m.Init(&Format{Name: "drive9", UUID: "test", Storage: "file", BlockSize: 4 << 20}, true); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	var ino Ino
+	var attr Attr
+	if st := m.Create(ctx, RootInode, "fat.db", 0644, 0, 0, &ino, &attr); st != 0 {
+		t.Fatalf("create: %v", st)
+	}
+	wp := m.(interface {
+		WriteParts(Context, Ino, uint32, []WritePart, time.Time) syscall.Errno
+	})
+	parts := make([]WritePart, maxSlices)
+	for i := range parts {
+		parts[i] = WritePart{Off: uint32(i), Slice: Slice{Id: uint64(i + 1), Size: 1, Len: 1}}
+	}
+	tr.n = map[string]int{}
+	if st := wp.WriteParts(ctx, ino, 0, parts, time.Now()); st != 0 {
+		t.Fatalf("WriteParts: %v", st)
+	}
+	deadline := time.After(2 * time.Second)
+	for tr.n[Drive9OpRead] == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("numSlices=maxSlices must launch compactChunk (doRead)")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestDrive9WritePartsDoesNotCompactBelowMaxSlices(t *testing.T) {
+	inner := newMemTransport()
+	tr := &countingTransport{Drive9Transport: inner, n: map[string]int{}}
+	conf := DefaultConf()
+	conf.NoBGJob = true
+	conf.MaxDeletes = 0
+	m := NewDrive9Meta(conf, tr)
+	ctx := NewContext(1, 1, []uint32{1})
+	if err := m.Init(&Format{Name: "drive9", UUID: "test", Storage: "file", BlockSize: 4 << 20}, true); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	var ino Ino
+	var attr Attr
+	if st := m.Create(ctx, RootInode, "thin.db", 0644, 0, 0, &ino, &attr); st != 0 {
+		t.Fatalf("create: %v", st)
+	}
+	wp := m.(interface {
+		WriteParts(Context, Ino, uint32, []WritePart, time.Time) syscall.Errno
+	})
+	parts := make([]WritePart, 400)
+	for i := range parts {
+		parts[i] = WritePart{Off: uint32(i), Slice: Slice{Id: uint64(i + 1), Size: 1, Len: 1}}
+	}
+	tr.n = map[string]int{}
+	if st := wp.WriteParts(ctx, ino, 0, parts, time.Now()); st != 0 {
+		t.Fatalf("WriteParts: %v", st)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if tr.n[Drive9OpRead] != 0 {
+		t.Fatalf("numSlices=400 launched compactChunk reads=%d (HTTP compact only at maxSlices)", tr.n[Drive9OpRead])
+	}
+}
+
+

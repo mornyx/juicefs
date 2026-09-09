@@ -196,6 +196,23 @@ func TestVFSBasic(t *testing.T) {
 
 }
 
+func TestWritebackCacheRewriteAfterFlushTo(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	ctx := NewLogContext(meta.Background())
+	fe, fh, e := v.Create(ctx, 1, "wb.dat", 0644, 0, syscall.O_RDWR)
+	if e != 0 {
+		t.Fatalf("create: %s", e)
+	}
+	block := v.Conf.Chunk.BlockSize
+	buf := make([]byte, block)
+	if e = v.Write(ctx, fe.Inode, buf, 0, fh); e != 0 {
+		t.Fatalf("write block: %s", e)
+	}
+	if e = v.Write(ctx, fe.Inode, []byte("HEAD"), 0, fh); e != 0 {
+		t.Fatalf("rewrite offset 0 after FlushTo: %s (writeback_cache must open a new slice, not EIO)", e)
+	}
+}
+
 func TestVFSIO(t *testing.T) {
 	v, _ := createTestVFS(nil, "")
 	ctx := NewLogContext(meta.Background())

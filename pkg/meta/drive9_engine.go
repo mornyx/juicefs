@@ -235,8 +235,12 @@ func (m *drive9Meta) doMknod(ctx Context, parent Ino, name string, _type uint8, 
 
 func (m *drive9Meta) doUnlink(ctx Context, parent Ino, name string, attr *Attr, skipCheckTrash ...bool) syscall.Errno {
 	skip := len(skipCheckTrash) == 1 && skipCheckTrash[0]
-	opened := drive9Opened(ctx)
-	if !opened && m.of != nil {
+	// JuiceFS sql_unlink checks of.IsOpen inside the same meta txn after
+	// reading the edge. An extra HTTP Lookup here turned every journal
+	// unlink (delete-mode COMMIT) into two RTTs. Trust the FUSE
+	// Drive9OpenedKey when present; only Lookup when the caller omitted it.
+	opened, openedSet := drive9Opened(ctx)
+	if !openedSet && m.of != nil {
 		var found Ino
 		var lattr Attr
 		if m.doLookup(ctx, parent, name, &found, &lattr) == 0 {
@@ -339,6 +343,135 @@ func (m *drive9Meta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sl
 // Used by VFS commitThread during Flush/Fsync so a WAL checkpoint is not
 // one TiDB txn per 4KiB page.
 func (m *drive9Meta) WriteParts(ctx Context, inode Ino, indx uint32, parts []WritePart, mtime time.Time) syscall.Errno {
+	return m.enqueueWrite(inode, indx, parts, mtime, true)
+}
+
+// QueueWriteParts is JuiceFS commitThread without waiting for HTTP: SQL
+// Meta.Write returns in µs so streaming commits do not stall Write().
+// Fsync/Flush uses WriteParts (wait=true) so durability still matches
+// JuiceFS --writeback (fsync waits for meta, not object PUT).
+func (m *drive9Meta) QueueWriteParts(ctx Context, inode Ino, indx uint32, parts []WritePart, mtime time.Time) syscall.Errno {
+	return m.enqueueWrite(inode, indx, parts, mtime, false)
+}
+
+func (m *drive9Meta) inodeWriter(inode Ino) *drive9InodeWriter {
+	m.writeMu.Lock()
+	defer m.writeMu.Unlock()
+	if m.writers == nil {
+		m.writers = make(map[Ino]*drive9InodeWriter)
+	}
+	w := m.writers[inode]
+	if w == nil {
+		w = &drive9InodeWriter{q: make(chan drive9WriteJob, 256)}
+		m.writers[inode] = w
+		go m.inodeWriteWorker(w)
+	}
+	return w
+}
+
+func (m *drive9Meta) enqueueWrite(inode Ino, indx uint32, parts []WritePart, mtime time.Time, wait bool) syscall.Errno {
+	if len(parts) == 0 && !wait {
+		return 0
+	}
+	copied := append([]WritePart(nil), parts...)
+	job := drive9WriteJob{inode: inode, indx: indx, parts: copied, mtime: mtime}
+	if wait {
+		job.done = make(chan syscall.Errno, 1)
+	}
+	m.inodeWriter(inode).q <- job
+	if !wait {
+		return 0
+	}
+	return <-job.done
+}
+
+// WaitWrites is JuiceFS Flush: return only after this inode's Meta.Write
+// HTTP has finished. A no-op job sits behind queued writes of this inode.
+func (m *drive9Meta) WaitWrites(inode Ino) syscall.Errno {
+	return m.enqueueWrite(inode, 0, nil, time.Time{}, true)
+}
+
+func (m *drive9Meta) inodeWriteWorker(w *drive9InodeWriter) {
+	for job := range w.q {
+		if len(job.parts) == 0 {
+			m.signalWriteBatch([]drive9WriteJob{job}, 0)
+			continue
+		}
+		batch := []drive9WriteJob{job}
+		parts := append([]WritePart(nil), job.parts...)
+		mtime := job.mtime
+		indx := job.indx
+		// JuiceFS SQL Meta.Write is µs so commitThread needs no delay.
+		// HTTP ~20–80ms: collect a few milliseconds so sqlite 4KiB spills
+		// under DELETE exclusive become one WriteParts, not one HTTP each.
+		timer := time.NewTimer(8 * time.Millisecond)
+		collect := job.done == nil && len(parts) < 64
+		for collect {
+			select {
+			case j, ok := <-w.q:
+				if !ok {
+					collect = false
+					break
+				}
+				if len(j.parts) == 0 {
+					st := m.commitWriteParts(job.inode, indx, parts, mtime)
+					m.signalWriteBatch(batch, st)
+					m.signalWriteBatch([]drive9WriteJob{j}, st)
+					batch = nil
+					parts = nil
+					collect = false
+				} else if j.indx == indx {
+					batch = append(batch, j)
+					parts = append(parts, j.parts...)
+					if j.mtime.After(mtime) {
+						mtime = j.mtime
+					}
+					if j.done != nil || len(parts) >= 64 {
+						collect = false
+					}
+				} else {
+					st := m.commitWriteParts(job.inode, indx, parts, mtime)
+					m.signalWriteBatch(batch, st)
+					batch = []drive9WriteJob{j}
+					parts = append([]WritePart(nil), j.parts...)
+					mtime = j.mtime
+					indx = j.indx
+					job = j
+					collect = j.done == nil && len(parts) < 64
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					timer.Reset(8 * time.Millisecond)
+				}
+			case <-timer.C:
+				collect = false
+			}
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		if len(parts) > 0 {
+			st := m.commitWriteParts(job.inode, indx, parts, mtime)
+			m.signalWriteBatch(batch, st)
+		}
+	}
+}
+
+func (m *drive9Meta) signalWriteBatch(batch []drive9WriteJob, st syscall.Errno) {
+	for _, j := range batch {
+		if j.done != nil {
+			j.done <- st
+		}
+	}
+}
+
+func (m *drive9Meta) commitWriteParts(inode Ino, indx uint32, parts []WritePart, mtime time.Time) syscall.Errno {
 	if len(parts) == 0 {
 		return 0
 	}
@@ -351,19 +484,62 @@ func (m *drive9Meta) WriteParts(ctx Context, inode Ino, indx uint32, parts []Wri
 	var numSlices int
 	var delta dirStat
 	var attr Attr
-	st := m.writeParts(ctx, inode, indx, parts, mtime, &numSlices, &delta, &attr)
+	st := m.writeParts(Background(), inode, indx, parts, mtime, &numSlices, &delta, &attr)
 	if st == 0 {
-		m.updateParentStat(ctx, inode, attr.Parent, delta.length, delta.space)
-		m.updateUserGroupStat(ctx, attr.Uid, attr.Gid, delta.space, 0)
-		if numSlices%100 == 99 || numSlices > 350 {
-			if numSlices < maxSlices {
-				go m.compactChunk(inode, indx, false, false, int(attr.Tier))
-			} else {
-				m.compactChunk(inode, indx, true, false, int(attr.Tier))
-			}
+		m.updateParentStat(Background(), inode, attr.Parent, delta.length, delta.space)
+		m.updateUserGroupStat(Background(), attr.Uid, attr.Gid, delta.space, 0)
+		// JuiceFS baseMeta.Write also compactChunk at numSlices>350, but
+		// that is a local SQL txn (µs). HTTP compact CAS is 50–400ms and
+		// serialized with sqlite fsync on the same chunk (crash01 --wait
+		// all). Bound the blob like JuiceFS maxSlices; do it asynchronously
+		// so Write/Flush is not the compact HTTP.
+		if numSlices >= maxSlices {
+			go m.compactChunk(inode, indx, true, false, int(attr.Tier))
 		}
 	}
 	return st
+}
+
+// Write is WriteParts of one slice so ncommit=1 does not use baseMeta.Write's
+// inline compactChunk (NoBGJob: compact is the drive9 compact loop).
+func (m *drive9Meta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno {
+	return m.WriteParts(ctx, inode, indx, []WritePart{{Off: off, Slice: slice}}, mtime)
+}
+
+// Read is baseMeta.Read without compactChunk. JuiceFS launches compact when a
+// chunk has ≥5 slices because SQL compact is µs; HTTP compact CAS contended
+// with sqlite exclusive (575 compact RPCs on community.sqlite).
+func (m *drive9Meta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) syscall.Errno {
+	f := m.of.find(inode)
+	if f != nil {
+		f.RLock()
+		defer f.RUnlock()
+	}
+	if ss, ok := m.of.ReadChunk(inode, indx); ok {
+		*slices = ss
+		return 0
+	}
+	*slices = nil
+	ss, st := m.en.doRead(ctx, inode, indx)
+	if st != 0 {
+		return st
+	}
+	if ss == nil {
+		return syscall.EIO
+	}
+	if len(ss) == 0 {
+		var attr Attr
+		if st = m.en.doGetAttr(ctx, inode, &attr); st != 0 {
+			return st
+		}
+		if attr.Typ != TypeFile {
+			return syscall.EPERM
+		}
+		return 0
+	}
+	*slices = buildSlice(ss)
+	m.of.CacheChunk(inode, indx, *slices)
+	return 0
 }
 
 func (m *drive9Meta) writeParts(ctx Context, inode Ino, indx uint32, parts []WritePart, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {

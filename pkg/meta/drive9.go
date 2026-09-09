@@ -80,9 +80,26 @@ const (
 // server-scheduled and client-executed via Drive9CommitCompact.
 var ErrCompactDelegated = fmt.Errorf("compact delegated to drive9 server")
 
+type drive9WriteJob struct {
+	inode Ino
+	indx  uint32
+	parts []WritePart
+	mtime time.Time
+	done  chan syscall.Errno
+}
+
+// drive9InodeWriter is JuiceFS fileWriter.commitThread: one serial Meta.Write
+// stream per inode. A global FIFO made Flush of file B wait for file A's HTTP
+// (speedtest delete 12s→26s). Different inodes run in parallel like SQL.
+type drive9InodeWriter struct {
+	q chan drive9WriteJob
+}
+
 type drive9Meta struct {
 	*baseMeta
-	tr Drive9Transport
+	tr      Drive9Transport
+	writeMu sync.Mutex
+	writers map[Ino]*drive9InodeWriter
 }
 
 var _ Meta = (*drive9Meta)(nil)
@@ -99,7 +116,10 @@ func NewDrive9Meta(conf *Config, tr Drive9Transport) Meta {
 	if conf.MaxDeletes == 0 {
 		conf.MaxDeletes = 0
 	}
-	m := &drive9Meta{tr: tr}
+	m := &drive9Meta{
+		tr:      tr,
+		writers: make(map[Ino]*drive9InodeWriter),
+	}
 	m.baseMeta = newBaseMeta("drive9", conf)
 	m.en = m
 	return m
@@ -123,16 +143,16 @@ func drive9Path(ctx Context) string {
 	return s
 }
 
-func drive9Opened(ctx Context) bool {
+func drive9Opened(ctx Context) (opened bool, set bool) {
 	if ctx == nil {
-		return false
+		return false, false
 	}
 	v := ctx.Value(Drive9OpenedKey)
 	if v == nil {
-		return false
+		return false, false
 	}
 	b, _ := v.(bool)
-	return b
+	return b, true
 }
 
 func (m *drive9Meta) call(ctx Context, op string, req, resp any) syscall.Errno {
@@ -348,17 +368,20 @@ type drive9SetAttrReq struct {
 }
 
 type drive9MknodReq struct {
-	Parent   Ino    `json:"parent"`
-	Name     string `json:"name"`
-	Type     uint8  `json:"type"`
-	Mode     uint16 `json:"mode"`
-	Cumask   uint16 `json:"cumask"`
-	Path     string `json:"path,omitempty"`
-	Inode    Ino    `json:"inode"`
-	Attr     Attr   `json:"attr"`
-	ProjPath string `json:"proj_path,omitempty"`
-	Uid      uint32 `json:"uid"`
-	Gid      uint32 `json:"gid"`
+	Parent   Ino         `json:"parent"`
+	Name     string      `json:"name"`
+	Type     uint8       `json:"type"`
+	Mode     uint16      `json:"mode"`
+	Cumask   uint16      `json:"cumask"`
+	Path     string      `json:"path,omitempty"`
+	Inode    Ino         `json:"inode"`
+	Attr     Attr        `json:"attr"`
+	ProjPath string      `json:"proj_path,omitempty"`
+	Uid      uint32      `json:"uid"`
+	Gid      uint32      `json:"gid"`
+	Indx     uint32      `json:"indx,omitempty"`
+	Parts    []WritePart `json:"parts,omitempty"`
+	Mtime    time.Time   `json:"mtime,omitempty"`
 }
 
 type drive9UnlinkReq struct {

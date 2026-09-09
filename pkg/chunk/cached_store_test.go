@@ -43,6 +43,28 @@ func forgetSlice(store ChunkStore, sliceId uint64, size int) error {
 	return w.Finish(size)
 }
 
+func TestWriteAtAfterFlushToIsOverwrite(t *testing.T) {
+	blob, err := object.CreateStorage("mem", "", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf := defaultConf
+	conf.CacheDir = t.TempDir()
+	store := NewCachedStore(blob, conf, nil)
+	w := store.NewWriter(7, 0)
+	buf := bytes.Repeat([]byte{0x61}, conf.BlockSize)
+	if _, err := w.WriteAt(buf, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.FlushTo(conf.BlockSize); err != nil {
+		t.Fatal(err)
+	}
+	_, err = w.WriteAt([]byte("HEAD"), 0)
+	if !errors.Is(err, ErrOverwriteUploaded) {
+		t.Fatalf("WriteAt after FlushTo: %v, want ErrOverwriteUploaded", err)
+	}
+}
+
 func testStore(t *testing.T, store ChunkStore) {
 	writer := store.NewWriter(1, 0)
 	data := []byte("hello world")

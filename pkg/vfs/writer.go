@@ -17,6 +17,7 @@
 package vfs
 
 import (
+	"errors"
 	"math/rand"
 	"runtime"
 	"sync"
@@ -30,6 +31,8 @@ import (
 
 const (
 	flushDuration = time.Second * 5
+	// errSliceSealed is internal: writeback_cache rewrote a FlushTo'd page.
+	errSliceSealed = syscall.Errno(0x5a5a)
 )
 
 type FileWriter interface {
@@ -132,6 +135,10 @@ func (s *sliceWriter) write(ctx meta.Context, off uint32, data []uint8) syscall.
 	f := s.chunk.file
 	_, err := s.writer.WriteAt(data, int64(off))
 	if err != nil {
+		if errors.Is(err, chunk.ErrOverwriteUploaded) {
+			// JuiceFS `-o writeback_cache`: kernel rewrites a staged page.
+			return errSliceSealed
+		}
 		logger.Warnf("write inode: %v chunk: %d off: %d %s", s.chunk.file.inode, s.id, off, err)
 		return syscall.EIO
 	}
@@ -187,6 +194,65 @@ type metaWriteParts interface {
 	WriteParts(ctx meta.Context, inode Ino, indx uint32, parts []meta.WritePart, mtime time.Time) syscall.Errno
 }
 
+type metaQueueWriteParts interface {
+	QueueWriteParts(ctx meta.Context, inode Ino, indx uint32, parts []meta.WritePart, mtime time.Time) syscall.Errno
+}
+
+// metaWaitWrites is drive9 HTTP meta: JuiceFS Flush waits until Meta.Write
+// has committed. Streaming commitThread uses QueueWriteParts so Write() is
+// not stalled (JuiceFS SQL Meta.Write is µs); Flush drains the inode queue.
+type metaWaitWrites interface {
+	WaitWrites(inode Ino) syscall.Errno
+}
+
+
+func writeMetaParts(m meta.Meta, inode Ino, indx uint32, items []*sliceWriter) syscall.Errno {
+	for _, it := range items {
+		if it == nil {
+			continue
+		}
+		if err := m.Write(meta.Background(), inode, indx, it.off, meta.Slice{Id: it.id, Size: it.length, Off: it.soff, Len: it.slen}, it.lastMod); err != 0 {
+			return err
+		}
+	}
+	return 0
+}
+
+func (c *chunkWriter) commitItems(f *fileWriter, items []*sliceWriter) syscall.Errno {
+	if len(items) == 0 {
+		return 0
+	}
+	parts := make([]meta.WritePart, len(items))
+	var lastMod time.Time
+	for i, it := range items {
+		parts[i] = meta.WritePart{Off: it.off, Slice: meta.Slice{Id: it.id, Size: it.length, Off: it.soff, Len: it.slen}}
+		if it.lastMod.After(lastMod) {
+			lastMod = it.lastMod
+		}
+	}
+	wait := f.flushwaiting > 0
+	var err syscall.Errno
+	if !wait {
+		if qw, ok := f.w.m.(metaQueueWriteParts); ok {
+			err = qw.QueueWriteParts(meta.Background(), f.inode, c.indx, parts, lastMod)
+		} else if bw, ok := f.w.m.(metaWriteParts); ok && len(parts) > 1 {
+			err = bw.WriteParts(meta.Background(), f.inode, c.indx, parts, lastMod)
+		} else {
+			err = writeMetaParts(f.w.m, f.inode, c.indx, items)
+		}
+	} else if bw, ok := f.w.m.(metaWriteParts); ok {
+		err = bw.WriteParts(meta.Background(), f.inode, c.indx, parts, lastMod)
+	} else {
+		err = writeMetaParts(f.w.m, f.inode, c.indx, items)
+	}
+	if err == 0 {
+		for _, it := range items {
+			f.w.reader.Invalidate(f.inode, uint64(c.indx)*meta.ChunkSize+uint64(it.off), uint64(it.slen))
+		}
+	}
+	return err
+}
+
 func (c *chunkWriter) commitThread() {
 	f := c.file
 	defer f.w.free(f)
@@ -204,23 +270,7 @@ func (c *chunkWriter) commitThread() {
 		for s.dep != nil && !s.dep.committed {
 			f.commitcond.WaitWithTimeout(time.Millisecond * 100)
 		}
-		ncommit := 1
-		if f.flushwaiting > 0 {
-			for {
-				ready := true
-				for _, x := range c.slices {
-					if !x.done {
-						ready = false
-						break
-					}
-				}
-				if ready {
-					ncommit = len(c.slices)
-					break
-				}
-				f.commitcond.WaitWithTimeout(time.Millisecond * 10)
-			}
-		}
+		ncommit := c.pickCommitCount()
 		err := s.err
 		for i := 0; i < ncommit; i++ {
 			if c.slices[i].err != 0 {
@@ -240,31 +290,7 @@ func (c *chunkWriter) commitThread() {
 		f.Unlock()
 
 		if err == 0 {
-			if ncommit > 1 {
-				if bw, ok := f.w.m.(metaWriteParts); ok {
-					parts := make([]meta.WritePart, ncommit)
-					var lastMod time.Time
-					for i, it := range items {
-						parts[i] = meta.WritePart{Off: it.off, Slice: meta.Slice{Id: it.id, Size: it.length, Off: it.soff, Len: it.slen}}
-						if it.lastMod.After(lastMod) {
-							lastMod = it.lastMod
-						}
-					}
-					err = bw.WriteParts(meta.Background(), f.inode, c.indx, parts, lastMod)
-					for _, it := range items {
-						f.w.reader.Invalidate(f.inode, uint64(c.indx)*meta.ChunkSize+uint64(it.off), uint64(it.slen))
-					}
-				} else {
-					ncommit = 1
-					items = items[:1]
-				}
-			}
-			if ncommit == 1 && err == 0 {
-				it := items[0]
-				ss := meta.Slice{Id: it.id, Size: it.length, Off: it.soff, Len: it.slen}
-				err = f.w.m.Write(meta.Background(), f.inode, c.indx, it.off, ss, it.lastMod)
-				f.w.reader.Invalidate(f.inode, uint64(c.indx)*meta.ChunkSize+uint64(it.off), uint64(ss.Len))
-			}
+			err = c.commitItems(f, items)
 		}
 
 		f.Lock()
@@ -293,6 +319,79 @@ func (c *chunkWriter) commitThread() {
 	}
 	f.freeChunk(c)
 	f.Unlock()
+}
+
+// writePartsBatch is the HTTP-meta coalescing ceiling. JuiceFS SQL Meta.Write
+// is cheap so commitThread used ncommit=1 except during Flush. drive9's
+// WriteParts is one RTT; sqlite page writes must not be one HTTP each.
+const writePartsBatch = 64
+
+func leadingDoneSlices(slices []*sliceWriter) int {
+	n := 0
+	for _, x := range slices {
+		if x == nil || !x.done || x.err != 0 {
+			break
+		}
+		n++
+	}
+	return n
+}
+
+func frozenInflight(slices []*sliceWriter) int {
+	n := 0
+	for _, s := range slices {
+		if s != nil && s.freezed && !s.done {
+			n++
+		}
+	}
+	return n
+}
+
+func clampCommitCount(n int) int {
+	if n < 1 {
+		return 1
+	}
+	if n > writePartsBatch {
+		return writePartsBatch
+	}
+	return n
+}
+
+// pickCommitCount is how many leading slices commitThread sends in one
+// Meta.Write / WriteParts. Caller holds f.Lock.
+//
+// JuiceFS SQL commits each frozen slice immediately (µs). HTTP meta must
+// still commit as slices freeze (delay-until-Flush made WAL --sync Flush
+// too heavy and failed wal-multiwrite01). Coalesce only slices whose
+// flushData is already in flight so sqlite 4KiB spills become one RTT.
+func (c *chunkWriter) pickCommitCount() int {
+	f := c.file
+	if f.flushwaiting > 0 {
+		for {
+			ready := true
+			for _, x := range c.slices {
+				if !x.done {
+					ready = false
+					break
+				}
+			}
+			if ready {
+				return len(c.slices)
+			}
+			f.commitcond.WaitWithTimeout(time.Millisecond * 10)
+		}
+	}
+	if _, ok := f.w.m.(metaWriteParts); !ok {
+		return 1
+	}
+	deadline := time.Now().Add(5 * time.Millisecond)
+	for {
+		n := leadingDoneSlices(c.slices)
+		if frozenInflight(c.slices) == 0 || n >= writePartsBatch || n == len(c.slices) || time.Now().After(deadline) {
+			return clampCommitCount(n)
+		}
+		f.commitcond.WaitWithTimeout(time.Millisecond)
+	}
 }
 
 type fileWriter struct {
@@ -331,45 +430,63 @@ func (f *fileWriter) freeChunk(c *chunkWriter) {
 	}
 }
 
+func (f *fileWriter) newSliceWriter(c *chunkWriter, off uint32) *sliceWriter {
+	s := &sliceWriter{
+		chunk:   c,
+		off:     off,
+		writer:  f.w.store.NewWriter(0, f.tierID),
+		notify:  utils.NewCond(&f.Mutex),
+		started: time.Now(),
+	}
+	go s.prepareID(meta.Background(), false)
+	c.slices = append(c.slices, s)
+	if len(c.slices) == 1 {
+		f.w.Lock()
+		f.refs++
+		f.w.Unlock()
+		go c.commitThread()
+		if uint64(c.indx)*meta.ChunkSize >= f.length {
+			// first slice of a new chunk, try to find the last slice of the last chunk as dependency
+			var lastChunk *chunkWriter
+			for i, oc := range f.chunks {
+				if i < c.indx && (lastChunk == nil || i > lastChunk.indx) {
+					lastChunk = oc
+				}
+			}
+			if lastChunk != nil {
+				var lastSlice *sliceWriter
+				for _, ls := range lastChunk.slices {
+					if ls.growing {
+						lastSlice = ls
+					}
+				}
+				s.dep = lastSlice
+			}
+		}
+	}
+	return s
+}
+
 // protected by file
 func (f *fileWriter) writeChunk(ctx meta.Context, indx uint32, off uint32, data []byte) syscall.Errno {
 	c := f.findChunk(indx)
 	s := c.findWritableSlice(off, uint32(len(data)))
 	if s == nil {
-		s = &sliceWriter{
-			chunk:   c,
-			off:     off,
-			writer:  f.w.store.NewWriter(0, f.tierID),
-			notify:  utils.NewCond(&f.Mutex),
-			started: time.Now(),
-		}
-		go s.prepareID(meta.Background(), false)
-		c.slices = append(c.slices, s)
-		if len(c.slices) == 1 {
-			f.w.Lock()
-			f.refs++
-			f.w.Unlock()
-			go c.commitThread()
-			if uint64(indx)*meta.ChunkSize >= f.length {
-				// first slice of a new chunk, try to find the last slice of the last chunk as dependency
-				var lastChunk *chunkWriter
-				for i, c := range f.chunks {
-					if i < indx && (lastChunk == nil || i > lastChunk.indx) {
-						lastChunk = c
-					}
-				}
-				if lastChunk != nil {
-					var lastSlice *sliceWriter
-					for _, s := range lastChunk.slices {
-						if s.growing {
-							lastSlice = s
-						}
-					}
-					s.dep = lastSlice
-				}
-			}
-		}
+		s = f.newSliceWriter(c, off)
 	}
+	if !s.growing && uint64(indx)*meta.ChunkSize+uint64(off)+uint64(len(data)) > f.length {
+		s.growing = true
+	}
+	st := s.write(ctx, off-s.off, data)
+	if st != errSliceSealed {
+		return st
+	}
+	// FUSE writeback_cache turned a sequential slice into a random rewrite
+	// of an already staged block. JuiceFS would also open a new slice
+	// (findWritableSlice overlap → nil); we missed the uploaded-prefix case.
+	s.freezed = true
+	go s.flushData()
+	s = f.newSliceWriter(c, off)
 	if !s.growing && uint64(indx)*meta.ChunkSize+uint64(off)+uint64(len(data)) > f.length {
 		s.growing = true
 	}
@@ -486,12 +603,19 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 			break
 		}
 	}
+	if err == 0 {
+		err = f.err
+	}
+	if err == 0 {
+		if w, ok := f.w.m.(metaWaitWrites); ok {
+			f.Unlock()
+			err = w.WaitWrites(f.inode)
+			f.Lock()
+		}
+	}
 	f.flushwaiting--
 	if f.flushwaiting == 0 && f.writewaiting > 0 {
 		f.writecond.Broadcast()
-	}
-	if err == 0 {
-		err = f.err
 	}
 	return err
 }

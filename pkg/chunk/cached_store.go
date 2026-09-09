@@ -43,6 +43,9 @@ const SlowRequest = time.Second * time.Duration(10)
 
 var (
 	logger = utils.GetLogger("juicefs")
+	// ErrOverwriteUploaded is FUSE writeback_cache: the kernel may rewrite a
+	// page that FlushTo already staged. vfs.writeChunk starts a new slice.
+	ErrOverwriteUploaded = errors.New("overwrite uploaded block")
 )
 
 type pendingItem struct {
@@ -269,7 +272,7 @@ func (s *wSlice) WriteAt(p []byte, off int64) (n int, err error) {
 		return 0, fmt.Errorf("write out of chunk boundary: %d > %d", int(off)+len(p), chunkSize)
 	}
 	if off < int64(s.uploaded) {
-		return 0, fmt.Errorf("Cannot overwrite uploaded block: %d < %d", off, s.uploaded)
+		return 0, fmt.Errorf("%w: %d < %d", ErrOverwriteUploaded, off, s.uploaded)
 	}
 
 	// Fill previous blocks with zeros

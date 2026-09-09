@@ -213,6 +213,7 @@ func (v *VFS) GetAttr(ctx Context, ino Ino, opened uint8) (entry *meta.Entry, er
 	var attr = &Attr{}
 	err = v.Meta.GetAttr(ctx, ino, attr)
 	if err == 0 {
+		v.UpdateLength(ino, attr)
 		entry = &meta.Entry{Inode: ino, Attr: attr}
 	}
 	return
@@ -860,6 +861,26 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 		v.invalidateAttr(ino)
 	}
 	return
+}
+
+
+// WriteBack is FUSE writeback_cache / mmap writepages when the kernel Fh is
+// already Released (sqlite WAL shm after _exit). JuiceFS fuse Write uses
+// in.Fh; the graft has a second handle table, so a still-open VFS handle on
+// the same inode is the same path. No live handle: dataWriter.Open like
+// JuiceFS recovered write.
+func (v *VFS) WriteBack(ctx Context, ino Ino, buf []byte, off uint64) syscall.Errno {
+	for _, h := range v.findAllHandles(ino) {
+		if h != nil && h.writer != nil {
+			return v.Write(ctx, ino, buf, off, h.fh)
+		}
+	}
+	w := v.writer.Open(ino, off+uint64(len(buf)), 0)
+	if st := w.Write(ctx, off, buf); st != 0 {
+		_ = w.Close(ctx)
+		return st
+	}
+	return w.Close(ctx)
 }
 
 func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh uint64) (err syscall.Errno) {
