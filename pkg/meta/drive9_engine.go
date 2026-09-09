@@ -506,6 +506,18 @@ func (m *drive9Meta) Write(ctx Context, inode Ino, indx uint32, off uint32, slic
 	return m.WriteParts(ctx, inode, indx, []WritePart{{Off: off, Slice: slice}}, mtime)
 }
 
+// Truncate drains this inode's queued slice commits before the truncate RPC.
+// The server derives the zeroed range from the stored length, so a commit
+// still sitting in the async write queue would be zeroed by a truncate-up
+// (or leave a stale length) even though the kernel already completed the
+// write. JuiceFS's synchronous Meta.Write made that ordering implicit.
+func (m *drive9Meta) Truncate(ctx Context, inode Ino, flags uint8, length uint64, attr *Attr, skipPermCheck bool) syscall.Errno {
+	if st := m.WaitWrites(inode); st != 0 {
+		return st
+	}
+	return m.baseMeta.Truncate(ctx, inode, flags, length, attr, skipPermCheck)
+}
+
 // Read is baseMeta.Read without compactChunk. JuiceFS launches compact when a
 // chunk has ≥5 slices because SQL compact is µs; HTTP compact CAS contended
 // with sqlite exclusive (575 compact RPCs on community.sqlite).

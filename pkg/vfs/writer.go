@@ -205,7 +205,6 @@ type metaWaitWrites interface {
 	WaitWrites(inode Ino) syscall.Errno
 }
 
-
 func writeMetaParts(m meta.Meta, inode Ino, indx uint32, items []*sliceWriter) syscall.Errno {
 	for _, it := range items {
 		if it == nil {
@@ -739,6 +738,15 @@ func (w *dataWriter) Flush(ctx meta.Context, inode Ino) syscall.Errno {
 	f := w.find(inode)
 	if f != nil {
 		return f.Flush(ctx)
+	}
+	// No writer state left for this inode, but the drive9 HTTP meta commits
+	// slices asynchronously (QueueWriteParts): a commit can still be in
+	// flight after the fileWriter was freed, so a reader/truncate would see a
+	// length and slice list older than a write the kernel already completed.
+	// JuiceFS's synchronous Meta.Write made that impossible; drain the
+	// per-inode queue instead of returning early.
+	if m, ok := w.m.(metaWaitWrites); ok {
+		return m.WaitWrites(inode)
 	}
 	return 0
 }
