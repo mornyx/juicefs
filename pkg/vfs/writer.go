@@ -205,6 +205,28 @@ type metaWaitWrites interface {
 	WaitWrites(inode Ino) syscall.Errno
 }
 
+// metaWritesSettled reports whether every write of an inode has already
+// reached metadata. drive9 meta queues slice commits behind an in-flight HTTP
+// request, so a slice can be gone from the write buffer while a reader that
+// asks metadata for it would still get the previous mapping.
+type metaWritesSettled interface {
+	WriteState(inode Ino) (pending int64, seq uint64)
+}
+
+// bufferedReadWriter is the FileWriter side of a read that can be answered
+// from the write buffer. It exists because a Flush here is a metadata commit
+// over HTTP plus a TiDB transaction, and it finishes (seals) the in-flight
+// slice of every chunk it touches: with the kernel writeback cache off, one
+// rewritten sqlite page otherwise becomes a new slice, a new object and a new
+// commit.
+type bufferedReadWriter interface {
+	// ReadBuffered fills p, which is indexed from off, with the newest bytes
+	// the writer still holds in memory for inode, and returns the ranges it
+	// filled. needFlush reports that some byte of the range is neither in the
+	// buffer nor visible in metadata yet, so only a Flush can answer it.
+	ReadBuffered(inode Ino, off uint64, p []byte) (covered []frange, needFlush bool)
+}
+
 func writeMetaParts(m meta.Meta, inode Ino, indx uint32, items []*sliceWriter) syscall.Errno {
 	for _, it := range items {
 		if it == nil {
@@ -500,6 +522,98 @@ func (f *fileWriter) totalSlices() int {
 	}
 	f.Unlock()
 	return cnt
+}
+
+// metaWriteState reports whether an inode's slice commits have all reached
+// metadata and how many commits have been enqueued so far. It fails closed: a
+// meta engine that cannot answer keeps the previous behaviour of flushing
+// before every read.
+func metaWriteState(m meta.Meta, ino Ino) (pending int64, seq uint64, ok bool) {
+	sw, ok := m.(metaWritesSettled)
+	if !ok {
+		return 0, 0, false
+	}
+	pending, seq = sw.WriteState(ino)
+	return pending, seq, true
+}
+
+// ReadBuffered implements bufferedReadWriter for the writer table. Caller may
+// hold no lock: the copy happens under the file lock so a slice cannot be
+// finished (and its pages released) while it is being read.
+func (w *dataWriter) ReadBuffered(inode Ino, off uint64, p []byte) ([]frange, bool) {
+	f := w.find(inode)
+	if f == nil {
+		// No writer state left, but a queued metadata commit may still be in
+		// flight: only a Flush (which drains the inode queue) can answer.
+		return nil, true
+	}
+	return f.ReadBuffered(off, p)
+}
+
+func (f *fileWriter) ReadBuffered(off uint64, p []byte) ([]frange, bool) {
+	f.Lock()
+	defer f.Unlock()
+	if len(p) == 0 {
+		return nil, false
+	}
+	end := off + uint64(len(p))
+	var covered []frange
+	needFlush := false
+	for _, c := range f.chunks {
+		base := uint64(c.indx) * meta.ChunkSize
+		for _, s := range c.slices {
+			if s == nil || s.err != 0 || s.writer == nil || s.slen == 0 {
+				continue
+			}
+			bw, ok := s.writer.(chunk.BufferedWriter)
+			if !ok {
+				continue
+			}
+			start := base + uint64(s.off)
+			written := uint64(s.slen)
+			if start+written <= off || start >= end {
+				continue
+			}
+			// [start, start+served) already went to the object store, and a
+			// slice only becomes visible to a reader when its metadata commit
+			// lands, so the buffer cannot answer for those bytes any more.
+			served := uint64(bw.BufferedStart())
+			if served > written {
+				served = written
+			}
+			if start+served > off && start < end {
+				needFlush = true
+			}
+			lo := max(off, start+served)
+			hi := min(end, start+written)
+			if hi <= lo {
+				continue
+			}
+			if n := bw.ReadBuffered(p[lo-off:hi-off], int(lo-start)); n > 0 {
+				covered = append(covered, frange{lo, uint64(n)})
+			}
+		}
+	}
+	return covered, needFlush
+}
+
+// bufferedValid extends the byte count the reader returned with the buffered
+// ranges that continue it. Bytes are only valid up to the first gap: a range
+// that starts after a hole cannot be reported as read.
+func bufferedValid(off, n uint64, covered []frange) uint64 {
+	valid := n
+	for {
+		grew := false
+		for _, r := range covered {
+			if r.off <= off+valid && r.end() > off+valid {
+				valid = r.end() - off
+				grew = true
+			}
+		}
+		if !grew {
+			return valid
+		}
+	}
 }
 
 func (w *dataWriter) usedBufferSize() int64 {

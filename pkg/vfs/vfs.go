@@ -787,6 +787,49 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 	}
 	defer h.Runlock()
 
+	// drive9 extent: Flush here is a metadata commit over HTTP plus a TiDB
+	// transaction, and it finishes (seals) the in-flight slice of every chunk
+	// of the inode, so a rewritten sqlite page would otherwise become a new
+	// slice, a new object and a new commit. Answer the read from the commit
+	// itself plus whatever the write buffer still holds instead, and keep the
+	// flush only for ranges the buffer has already handed to the object store
+	// without their commit having landed.
+	//
+	// Two conditions protect this: no commit of the inode may be in flight
+	// when the read starts (a slice leaves the write buffer the moment its
+	// commit is queued, while metadata still holds the previous mapping), and
+	// no commit may be enqueued while the read runs (the reader caches the
+	// mapping it read, and nothing would invalidate a window it filled from a
+	// mapping that a queued commit is about to replace).
+	if bw, ok := v.writer.(bufferedReadWriter); ok {
+		if pending, seq, supported := metaWriteState(v.Meta, ino); supported && pending == 0 {
+			nn, nerr := h.reader.Read(ctx, off, buf)
+			for nerr == syscall.EAGAIN {
+				nn, nerr = h.reader.Read(ctx, off, buf)
+			}
+			covered, needFlush := bw.ReadBuffered(ino, off, buf)
+			if _, seq2, _ := metaWriteState(v.Meta, ino); seq2 != seq {
+				v.reader.Invalidate(ino, off, uint64(size))
+				needFlush = true
+			}
+			if !needFlush && (len(covered) > 0 || off+uint64(size) <= h.reader.GetLength()) {
+				n, err = nn, nerr
+				if err == 0 && len(covered) > 0 {
+					// Bytes the reader could not see yet: its window only has
+					// the committed mapping.
+					if valid := bufferedValid(off, uint64(n), covered); valid > uint64(n) {
+						n = int(valid)
+					}
+				}
+				if err == syscall.ENOENT {
+					err = syscall.EBADF
+				}
+				h.removeOp(ctx)
+				return
+			}
+		}
+	}
+
 	_ = v.writer.Flush(ctx, ino)
 	n, err = h.reader.Read(ctx, off, buf)
 	for err == syscall.EAGAIN {
@@ -862,7 +905,6 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 	}
 	return
 }
-
 
 // WriteBack is FUSE writeback_cache / mmap writepages when the kernel Fh is
 // already Released (sqlite WAL shm after _exit). JuiceFS fuse Write uses

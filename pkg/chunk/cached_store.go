@@ -263,6 +263,53 @@ func (s *wSlice) SetID(id uint64) {
 	s.id = id
 }
 
+// BufferedStart implements BufferedWriter. uploaded is the offset up to which
+// blocks have been handed to the object store, at which point their pages are
+// released and this writer can no longer answer for them.
+func (s *wSlice) BufferedStart() int { return s.uploaded }
+
+// ReadBuffered implements BufferedWriter. It walks the same page layout that
+// WriteAt fills, so it never exposes bytes that were not written.
+func (s *wSlice) ReadBuffered(p []byte, off int) int {
+	if len(p) == 0 || off < s.uploaded || off >= s.length {
+		return 0
+	}
+	n := 0
+	for n < len(p) {
+		pos := off + n
+		if pos >= s.length {
+			break
+		}
+		indx := s.index(pos)
+		if indx >= len(s.pages) {
+			break
+		}
+		bs := pageSize
+		if indx > 0 || bs > s.store.conf.BlockSize {
+			bs = s.store.conf.BlockSize
+		}
+		boff := pos % s.store.conf.BlockSize
+		bi := boff / bs
+		if bi >= len(s.pages[indx]) {
+			break
+		}
+		page := s.pages[indx][bi]
+		if page == nil {
+			break
+		}
+		bo := boff % bs
+		if bo >= len(page.Data) {
+			break
+		}
+		c := copy(p[n:], page.Data[bo:])
+		if c == 0 {
+			break
+		}
+		n += c
+	}
+	return n
+}
+
 func (s *wSlice) SetWriteback(enabled bool) {
 	s.writeback = enabled
 }

@@ -37,6 +37,21 @@ type Writer interface {
 	Abort()
 }
 
+// BufferedWriter is implemented by writers that keep written blocks in memory
+// until Finish hands them to the object store. A reader can use it to serve
+// read-your-writes from the write buffer, which matters when finishing a block
+// is expensive (an HTTP metadata commit) or seals it against further writes.
+type BufferedWriter interface {
+	// BufferedStart returns the offset below which data has already been
+	// uploaded and its memory released, so the buffer can no longer answer
+	// for it even though the slice may not be visible in metadata yet.
+	BufferedStart() int
+	// ReadBuffered copies up to len(p) bytes starting at off, both relative
+	// to the start of this slice, and returns how many bytes were copied. It
+	// stops at the first byte that is no longer in memory.
+	ReadBuffered(p []byte, off int) int
+}
+
 type ChunkStore interface {
 	NewReader(id uint64, length int) Reader
 	NewWriter(id uint64, tierID uint8) Writer

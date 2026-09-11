@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -93,6 +94,15 @@ type drive9WriteJob struct {
 // (speedtest delete 12s→26s). Different inodes run in parallel like SQL.
 type drive9InodeWriter struct {
 	q chan drive9WriteJob
+	// pending counts enqueued jobs whose commit has not reached metadata yet.
+	// A slice that already left the writer's buffer is only readable once its
+	// metadata commit lands, so readers consult this before serving a read
+	// from the write buffer instead of flushing.
+	pending atomic.Int64
+	// seq increments on every enqueue. A reader records it around its read so
+	// that a commit which came and went during the read still invalidates the
+	// reader window that read may have cached from the pre-commit mapping.
+	seq atomic.Uint64
 }
 
 type drive9Meta struct {

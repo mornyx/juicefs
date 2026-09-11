@@ -378,11 +378,31 @@ func (m *drive9Meta) enqueueWrite(inode Ino, indx uint32, parts []WritePart, mti
 	if wait {
 		job.done = make(chan syscall.Errno, 1)
 	}
-	m.inodeWriter(inode).q <- job
+	w := m.inodeWriter(inode)
+	w.pending.Add(1)
+	w.seq.Add(1)
+	w.q <- job
 	if !wait {
 		return 0
 	}
-	return <-job.done
+	st := <-job.done
+	return st
+}
+
+// WriteState reports an inode's metadata commit state: how many enqueued
+// commits have not landed yet, and a sequence number that changes on every
+// enqueue. A reader that still holds the written bytes in its buffer may
+// answer from it; one whose bytes already went to the object store may not,
+// because the slice only becomes readable when its commit lands. Meta engines
+// that cannot answer keep the caller's Flush.
+func (m *drive9Meta) WriteState(inode Ino) (pending int64, seq uint64) {
+	m.writeMu.Lock()
+	w := m.writers[inode]
+	m.writeMu.Unlock()
+	if w == nil {
+		return 0, 0
+	}
+	return w.pending.Load(), w.seq.Load()
 }
 
 // WaitWrites is JuiceFS Flush: return only after this inode's Meta.Write
@@ -464,7 +484,13 @@ func (m *drive9Meta) inodeWriteWorker(w *drive9InodeWriter) {
 }
 
 func (m *drive9Meta) signalWriteBatch(batch []drive9WriteJob, st syscall.Errno) {
+	if len(batch) == 0 {
+		return
+	}
+	// A batch is always one inode's jobs: the worker drains a single queue.
+	w := m.inodeWriter(batch[0].inode)
 	for _, j := range batch {
+		w.pending.Add(-1)
 		if j.done != nil {
 			j.done <- st
 		}
