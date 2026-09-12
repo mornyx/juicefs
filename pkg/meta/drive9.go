@@ -105,11 +105,48 @@ type drive9InodeWriter struct {
 	seq atomic.Uint64
 }
 
+// drive9ChunkCacheTTL bounds how long a chunk mapping cached by this client is
+// trusted without asking the server again. The mount is close-to-open for
+// everything else, so a mapping only has to outlive the read-your-writes
+// pattern it was cached for; after this it is re-read inside a transaction.
+const drive9ChunkCacheTTL = time.Second
+
 type drive9Meta struct {
 	*baseMeta
 	tr      Drive9Transport
 	writeMu sync.Mutex
 	writers map[Ino]*drive9InodeWriter
+
+	chunkAtMu sync.Mutex
+	chunkAt   map[Ino]map[uint32]time.Time
+}
+
+// noteChunkCached records when a chunk mapping was last confirmed by the server.
+func (m *drive9Meta) noteChunkCached(inode Ino, indx uint32) {
+	m.chunkAtMu.Lock()
+	defer m.chunkAtMu.Unlock()
+	if m.chunkAt == nil || len(m.chunkAt) > 8192 {
+		// Bounded: a size limit only costs refetches, never correctness.
+		m.chunkAt = make(map[Ino]map[uint32]time.Time)
+	}
+	byIndx := m.chunkAt[inode]
+	if byIndx == nil {
+		byIndx = make(map[uint32]time.Time)
+		m.chunkAt[inode] = byIndx
+	}
+	byIndx[indx] = time.Now()
+}
+
+// chunkCacheFresh reports whether a cached mapping is still within its TTL.
+func (m *drive9Meta) chunkCacheFresh(inode Ino, indx uint32) bool {
+	m.chunkAtMu.Lock()
+	defer m.chunkAtMu.Unlock()
+	byIndx := m.chunkAt[inode]
+	if byIndx == nil {
+		return false
+	}
+	at, ok := byIndx[indx]
+	return ok && time.Since(at) < drive9ChunkCacheTTL
 }
 
 var _ Meta = (*drive9Meta)(nil)
@@ -475,6 +512,11 @@ type drive9WriteResp struct {
 	Attr      *Attr `json:"attr,omitempty"`
 	Length    int64 `json:"delta_length"`
 	Space     int64 `json:"delta_space"`
+	// Slices is the chunk's mapping after this write, as the server computed it
+	// inside the same transaction. Caching it keeps the open-file chunk cache
+	// valid across our own writes: one chunk spans 64 MB, so dropping the
+	// mapping would cost an HTTP metadata query on every following read.
+	Slices []byte `json:"slices,omitempty"`
 }
 
 type drive9TruncateReq struct {

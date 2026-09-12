@@ -336,7 +336,7 @@ func (m *drive9Meta) doList(ctx Context, inode Ino) ([]*slice, syscall.Errno) {
 }
 
 func (m *drive9Meta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
-	return m.writeParts(ctx, inode, indx, []WritePart{{Off: off, Slice: slice}}, mtime, numSlices, delta, attr)
+	return m.writeParts(ctx, inode, indx, []WritePart{{Off: off, Slice: slice}}, mtime, numSlices, delta, attr, nil)
 }
 
 // WriteParts commits many slices of one chunk in a single HTTP meta RPC.
@@ -506,12 +506,29 @@ func (m *drive9Meta) commitWriteParts(inode Ino, indx uint32, parts []WritePart,
 		f.Lock()
 		defer f.Unlock()
 	}
-	defer func() { m.of.InvalidateChunk(inode, indx) }()
 	var numSlices int
 	var delta dirStat
 	var attr Attr
-	st := m.writeParts(Background(), inode, indx, parts, mtime, &numSlices, &delta, &attr)
+	var written []byte
+	st := m.writeParts(Background(), inode, indx, parts, mtime, &numSlices, &delta, &attr, &written)
 	if st == 0 {
+		// Keep the chunk mapping this write produced instead of dropping it:
+		// the server serialised it inside the same transaction, so it is
+		// exactly what a follow-up read would fetch, and a chunk spans 64 MB
+		// (a whole sqlite database), so dropping it costs one HTTP metadata
+		// query per read for the rest of the workload. Anything else that can
+		// change the mapping (truncate, compact) invalidates it itself.
+		if ss := readSliceBuf(written); len(ss) > 0 {
+			m.of.CacheChunk(inode, indx, buildSlice(ss))
+			m.noteChunkCached(inode, indx)
+			// InvalidateChunk also drops the open file's cached attributes, and
+			// the write that just happened is exactly when they are stale: a
+			// freshly created file caches Length=0, and keeping the mapping must
+			// not keep that length. Invalidate the attributes only.
+			m.of.InvalidateChunk(inode, invalidateAttrOnly)
+		} else {
+			m.of.InvalidateChunk(inode, indx)
+		}
 		m.updateParentStat(Background(), inode, attr.Parent, delta.length, delta.space)
 		m.updateUserGroupStat(Background(), attr.Uid, attr.Gid, delta.space, 0)
 		// JuiceFS baseMeta.Write also compactChunk at numSlices>350, but
@@ -553,7 +570,7 @@ func (m *drive9Meta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) 
 		f.RLock()
 		defer f.RUnlock()
 	}
-	if ss, ok := m.of.ReadChunk(inode, indx); ok {
+	if ss, ok := m.of.ReadChunk(inode, indx); ok && m.chunkCacheFresh(inode, indx) {
 		*slices = ss
 		return 0
 	}
@@ -577,10 +594,11 @@ func (m *drive9Meta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) 
 	}
 	*slices = buildSlice(ss)
 	m.of.CacheChunk(inode, indx, *slices)
+	m.noteChunkCached(inode, indx)
 	return 0
 }
 
-func (m *drive9Meta) writeParts(ctx Context, inode Ino, indx uint32, parts []WritePart, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr) syscall.Errno {
+func (m *drive9Meta) writeParts(ctx Context, inode Ino, indx uint32, parts []WritePart, mtime time.Time, numSlices *int, delta *dirStat, attr *Attr, written *[]byte) syscall.Errno {
 	if len(parts) == 0 {
 		return 0
 	}
@@ -594,6 +612,9 @@ func (m *drive9Meta) writeParts(ctx Context, inode Ino, indx uint32, parts []Wri
 	st := m.call(ctx, Drive9OpWrite, req, &resp)
 	if st = respErrno(resp.Errno, st); st != 0 {
 		return st
+	}
+	if written != nil {
+		*written = resp.Slices
 	}
 	if numSlices != nil {
 		*numSlices = resp.NumSlices
