@@ -239,7 +239,10 @@ func writeMetaParts(m meta.Meta, inode Ino, indx uint32, items []*sliceWriter) s
 	return 0
 }
 
-func (c *chunkWriter) commitItems(f *fileWriter, items []*sliceWriter) syscall.Errno {
+// commitItems commits items to metadata. flushWaiting is the flushwaiting>0
+// state sampled by the caller under the file lock: this function runs with the
+// lock released, so it must not read the field itself.
+func (c *chunkWriter) commitItems(f *fileWriter, items []*sliceWriter, flushWaiting bool) syscall.Errno {
 	if len(items) == 0 {
 		return 0
 	}
@@ -251,9 +254,8 @@ func (c *chunkWriter) commitItems(f *fileWriter, items []*sliceWriter) syscall.E
 			lastMod = it.lastMod
 		}
 	}
-	wait := f.flushwaiting > 0
 	var err syscall.Errno
-	if !wait {
+	if !flushWaiting {
 		if qw, ok := f.w.m.(metaQueueWriteParts); ok {
 			err = qw.QueueWriteParts(meta.Background(), f.inode, c.indx, parts, lastMod)
 		} else if bw, ok := f.w.m.(metaWriteParts); ok && len(parts) > 1 {
@@ -308,10 +310,14 @@ func (c *chunkWriter) commitThread() {
 			ncommit = 1
 		}
 		items := append([]*sliceWriter(nil), c.slices[:ncommit]...)
+		// Sample the flush state while the file lock is still held:
+		// commitItems runs with the lock released and must not read
+		// f.flushwaiting, which flush() mutates under that lock.
+		flushWaiting := f.flushwaiting > 0
 		f.Unlock()
 
 		if err == 0 {
-			err = c.commitItems(f, items)
+			err = c.commitItems(f, items, flushWaiting)
 		}
 
 		f.Lock()

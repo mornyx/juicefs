@@ -713,4 +713,66 @@ func TestDrive9WritePartsDoesNotCompactBelowMaxSlices(t *testing.T) {
 	}
 }
 
+// failFirstWriteTransport fails the first queued write commit, then succeeds.
+type failFirstWriteTransport struct {
+	Drive9Transport
+	mu     sync.Mutex
+	failed bool
+}
 
+func (f *failFirstWriteTransport) Call(ctx Context, op string, req, resp any) syscall.Errno {
+	if op == Drive9OpWrite {
+		f.mu.Lock()
+		first := !f.failed
+		f.failed = true
+		f.mu.Unlock()
+		if first {
+			return syscall.EIO
+		}
+	}
+	return f.Drive9Transport.Call(ctx, op, req, resp)
+}
+
+// TestDrive9WaitWritesReportsEarlierAsyncFailure is the barrier contract: a
+// QueueWriteParts batch has no caller to return to, so if its commit fails the
+// error has to be remembered and reported by the next WaitWrites. Otherwise VFS
+// Flush answers success (and the kernel marks the page clean) although metadata
+// never referenced the block that was uploaded.
+func TestDrive9WaitWritesReportsEarlierAsyncFailure(t *testing.T) {
+	inner := newMemTransport()
+	tr := &failFirstWriteTransport{Drive9Transport: inner}
+	conf := DefaultConf()
+	conf.NoBGJob = true
+	conf.MaxDeletes = 0
+	m := NewDrive9Meta(conf, tr)
+	ctx := NewContext(1, 1, []uint32{1})
+	if err := m.Init(&Format{Name: "drive9", UUID: "test", Storage: "file", BlockSize: 4 << 20}, true); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	var ino Ino
+	var attr Attr
+	if st := m.Create(ctx, RootInode, "async.db", 0644, 0, 0, &ino, &attr); st != 0 {
+		t.Fatalf("create: %v", st)
+	}
+	if st := m.Open(ctx, ino, syscall.O_RDWR, &attr); st != 0 {
+		t.Fatalf("open: %v", st)
+	}
+	var id uint64
+	if st := m.NewSlice(ctx, &id); st != 0 {
+		t.Fatalf("newslice: %v", st)
+	}
+	// QueueWriteParts never blocks on the HTTP call: this commit fails with
+	// nobody listening.
+	if st := m.(*drive9Meta).QueueWriteParts(ctx, ino, 0, []WritePart{
+		{Off: 0, Slice: Slice{Id: id, Size: 4, Off: 0, Len: 4}},
+	}, time.Now()); st != 0 {
+		t.Fatalf("queue: %v", st)
+	}
+	if st := m.(*drive9Meta).WaitWrites(ino); st != syscall.EIO {
+		t.Fatalf("WaitWrites after a failed queued commit = %v, want EIO", st)
+	}
+	// The error stays visible for the inode: the bytes are still missing.
+	if st := m.(*drive9Meta).WaitWrites(ino); st != syscall.EIO {
+		t.Fatalf("second WaitWrites = %v, want the sticky EIO", st)
+	}
+}

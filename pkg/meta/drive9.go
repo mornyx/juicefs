@@ -103,6 +103,34 @@ type drive9InodeWriter struct {
 	// that a commit which came and went during the read still invalidates the
 	// reader window that read may have cached from the pre-commit mapping.
 	seq atomic.Uint64
+	// err is the sticky first commit failure of this inode. Queued commits
+	// (QueueWriteParts, done == nil) have nobody to hand their error to, so it
+	// is remembered here and reported by the next WaitWrites — otherwise a
+	// Flush could return success although the batch it waited behind failed
+	// and the data it acknowledged is not referenced by metadata. It stays set
+	// for the inode's writer lifetime, matching fileWriter.err upstream.
+	err atomic.Int32
+}
+
+// recordCommitError remembers the first commit failure of an inode.
+func (w *drive9InodeWriter) recordCommitError(st syscall.Errno) {
+	if w == nil || st == 0 {
+		return
+	}
+	w.err.CompareAndSwap(0, int32(st))
+}
+
+// takeCommitError reports the sticky commit failure, if any. The error is
+// sticky (not consumed): the bytes it refers to are still missing from
+// metadata, so every later barrier for this inode must keep failing.
+func (w *drive9InodeWriter) takeCommitError() syscall.Errno {
+	if w == nil {
+		return 0
+	}
+	if st := w.err.Load(); st != 0 {
+		return syscall.Errno(st)
+	}
+	return 0
 }
 
 // drive9ChunkCacheTTL bounds how long a chunk mapping cached by this client is

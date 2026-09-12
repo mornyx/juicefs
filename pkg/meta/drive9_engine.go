@@ -406,9 +406,19 @@ func (m *drive9Meta) WriteState(inode Ino) (pending int64, seq uint64) {
 }
 
 // WaitWrites is JuiceFS Flush: return only after this inode's Meta.Write
-// HTTP has finished. A no-op job sits behind queued writes of this inode.
+// HTTP has finished. A no-op job sits behind queued writes of this inode, and
+// the inode's sticky commit error is reported after it: a queued batch that
+// failed earlier has nobody to return to, so without this a Flush would answer
+// success for data metadata never referenced.
 func (m *drive9Meta) WaitWrites(inode Ino) syscall.Errno {
-	return m.enqueueWrite(inode, 0, nil, time.Time{}, true)
+	st := m.enqueueWrite(inode, 0, nil, time.Time{}, true)
+	if st != 0 {
+		return st
+	}
+	m.writeMu.Lock()
+	w := m.writers[inode]
+	m.writeMu.Unlock()
+	return w.takeCommitError()
 }
 
 func (m *drive9Meta) inodeWriteWorker(w *drive9InodeWriter) {
@@ -489,6 +499,7 @@ func (m *drive9Meta) signalWriteBatch(batch []drive9WriteJob, st syscall.Errno) 
 	}
 	// A batch is always one inode's jobs: the worker drains a single queue.
 	w := m.inodeWriter(batch[0].inode)
+	w.recordCommitError(st)
 	for _, j := range batch {
 		w.pending.Add(-1)
 		if j.done != nil {
