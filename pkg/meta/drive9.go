@@ -36,7 +36,9 @@ const Drive9PathKey CtxKey = "drive9.path"
 
 // Drive9OpenedKey is set by the FUSE frontend when the unlinking client still
 // holds the file open. The server then inserts a sustained row instead of
-// dropping the JuiceFS node (open-unlinked).
+// dropping the JuiceFS node (open-unlinked). It is a local-mount hint only:
+// cross-runtime holders come from the jfs_sustained rows Open registers via
+// Drive9OpOpenRef, which the server's Unlink also consults.
 const Drive9OpenedKey CtxKey = "drive9.opened"
 
 // Drive9Transport is the stateless RPC used by the drive9 meta engine.
@@ -70,6 +72,7 @@ const (
 	Drive9OpCompact           = "compact"
 	Drive9OpDeleteSlice       = "delete_slice"
 	Drive9OpDeleteSustained   = "delete_sustained"
+	Drive9OpOpenRef           = "open_ref"
 	Drive9OpFlock             = "flock"
 	Drive9OpGetlk             = "getlk"
 	Drive9OpSetlk             = "setlk"
@@ -147,6 +150,12 @@ type drive9Meta struct {
 
 	chunkAtMu sync.Mutex
 	chunkAt   map[Ino]map[uint32]time.Time
+
+	// openRefs remembers the inodes this session has registered as open
+	// holders on the server (Drive9OpOpenRef). See the Open/Close overrides
+	// in drive9_engine.go.
+	openRefsMu sync.Mutex
+	openRefs   map[Ino]bool
 }
 
 // noteChunkCached records when a chunk mapping was last confirmed by the server.
@@ -192,8 +201,9 @@ func NewDrive9Meta(conf *Config, tr Drive9Transport) Meta {
 		conf.MaxDeletes = 0
 	}
 	m := &drive9Meta{
-		tr:      tr,
-		writers: make(map[Ino]*drive9InodeWriter),
+		tr:       tr,
+		writers:  make(map[Ino]*drive9InodeWriter),
+		openRefs: make(map[Ino]bool),
 	}
 	m.baseMeta = newBaseMeta("drive9", conf)
 	m.en = m

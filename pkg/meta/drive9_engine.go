@@ -684,6 +684,104 @@ func (m *drive9Meta) doDeleteSlice(id uint64, size uint32) error {
 	return nil
 }
 
+// Open extends baseMeta.Open with a server-side open-holder registration.
+//
+// JuiceFS decides "is this inode still open" from the unlinking client's own
+// handle table, which is invisible to every other mount: a file open here and
+// unlinked by another runtime was reclaimed under the open handle, and the
+// local fd then failed with EBADF. The drive9 server therefore keeps the
+// holders itself: open_ref inserts a jfs_sustained row keyed by this session
+// (the same record unlink-while-open uses), the server's Unlink consults it
+// before reclaiming, and Close (or the stale-session sweep after a crash)
+// removes it.
+//
+// The registration is one RPC per (session, inode), not per fd: openRefs
+// caches what this session already registered, so only the first Open pays.
+// A failed registration fails the Open itself — proceeding would hand the
+// caller a handle the server may already be reclaiming.
+func (m *drive9Meta) Open(ctx Context, inode Ino, flags uint32, attr *Attr) syscall.Errno {
+	st := m.baseMeta.Open(ctx, inode, flags, attr)
+	if st != 0 {
+		return st
+	}
+	// Directories are opened and closed by every readdir and hold no data of
+	// their own; registering them would turn each listing into two RPCs for
+	// no reclamation benefit.
+	if attr == nil || attr.Typ != TypeDirectory {
+		if st := m.registerOpenRef(ctx, inode); st != 0 {
+			return st
+		}
+	}
+	return 0
+}
+
+// Close releases the server-side holder when the last local fd for the inode
+// closes. It mirrors baseMeta.Close's body (the last-close fact it needs is
+// not propagated by the base method) and adds the holder release; the
+// removedFiles branch is kept so unlinked-while-open inodes keep their
+// upstream close behavior even if a path ever skips the registration.
+func (m *drive9Meta) Close(ctx Context, inode Ino) syscall.Errno {
+	if m.of.Close(inode) {
+		m.Lock()
+		_, removed := m.removedFiles[inode]
+		if removed {
+			delete(m.removedFiles, inode)
+		}
+		m.Unlock()
+		if removed {
+			_ = m.doDeleteSustainedInode(m.sid, inode)
+		}
+		m.releaseOpenRef(ctx, inode)
+	}
+	return 0
+}
+
+// registerOpenRef tells the server this session holds inode open, unless it
+// already said so. The node-row lock in the server's transaction orders this
+// against a concurrent Unlink of the same inode: either the holder row is
+// visible when Unlink decides, or the node is already gone and the ENOENT
+// fails the Open.
+func (m *drive9Meta) registerOpenRef(ctx Context, inode Ino) syscall.Errno {
+	m.openRefsMu.Lock()
+	registered := m.openRefs[inode]
+	m.openRefsMu.Unlock()
+	if registered {
+		return 0
+	}
+	var resp drive9ErrnoResp
+	st := m.call(ctx, Drive9OpOpenRef, &drive9SustainedReq{Sid: m.sid, Inode: inode}, &resp)
+	if st != 0 {
+		return st
+	}
+	if resp.Errno != 0 {
+		return syscall.Errno(resp.Errno)
+	}
+	m.openRefsMu.Lock()
+	m.openRefs[inode] = true
+	m.openRefsMu.Unlock()
+	return 0
+}
+
+// releaseOpenRef drops the holder row on last close. Best-effort: on failure
+// the row stays and the data is simply reclaimed later (next close of a
+// reopened fd, or the stale-session sweep), which is the safe direction —
+// never a premature reclaim.
+func (m *drive9Meta) releaseOpenRef(ctx Context, inode Ino) {
+	m.openRefsMu.Lock()
+	registered := m.openRefs[inode]
+	m.openRefsMu.Unlock()
+	if !registered {
+		return
+	}
+	if err := m.doDeleteSustainedInode(m.sid, inode); err != nil {
+		logger.Warnf("release open holder for inode %d: %s", inode, err)
+		return
+	}
+	m.openRefsMu.Lock()
+	delete(m.openRefs, inode)
+	m.openRefsMu.Unlock()
+}
+
 func (m *drive9Meta) doDeleteSustainedInode(sid uint64, inode Ino) error {
 	var resp drive9ErrnoResp
 	st := m.call(Background(), Drive9OpDeleteSustained, &drive9SustainedReq{Sid: sid, Inode: inode}, &resp)
