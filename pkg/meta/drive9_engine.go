@@ -804,9 +804,12 @@ func (m *drive9Meta) registerOpenRef(ctx Context, inode Ino) syscall.Errno {
 // the release finishes first and the new open re-registers, or the IsOpen
 // re-check below sees the new fd and aborts the release.
 //
-// Best-effort: on failure the row stays and the data is simply reclaimed later
-// (the next close of a reopened fd, or the stale-session sweep), which is the
-// safe direction — never a premature reclaim.
+// Best-effort, but failure-invalidating: an RPC error leaves the server-side
+// row in an unknown state (committed-and-response-lost is indistinguishable
+// from not-committed), so the local entry is dropped either way and the next
+// Open re-registers. Both unknown outcomes are safe — a surviving row only
+// delays reclamation until the sweep, a deleted row is recreated — while
+// trusting a stale entry would leave a live fd unprotected.
 func (m *drive9Meta) releaseOpenRef(ctx Context, inode Ino) {
 	m.openRefsMu.Lock()
 	defer m.openRefsMu.Unlock()
@@ -819,8 +822,16 @@ func (m *drive9Meta) releaseOpenRef(ctx Context, inode Ino) {
 		return
 	}
 	if err := m.doDeleteSustainedInode(m.sid, inode); err != nil {
-		logger.Warnf("release open holder for inode %d: %s", inode, err)
-		return
+		// A failed RPC does NOT mean the row survived: the server may have
+		// committed the delete and lost the response, and the client cannot
+		// tell the two apart. The cached "registered" state is therefore
+		// invalid — drop it. If the row did survive, keeping no entry costs
+		// only delayed reclamation (the next Open's open_ref is an INSERT
+		// IGNORE no-op on it, and the stale-session sweep removes it); if the
+		// row was deleted, that same Open re-registers and the holder is
+		// valid again. Keeping the entry instead would make the re-Open skip
+		// registration and leave a live fd with no server-side holder.
+		logger.Warnf("release open holder for inode %d: %s (outcome unknown; next open re-registers)", inode, err)
 	}
 	delete(m.openRefs, inode)
 }
