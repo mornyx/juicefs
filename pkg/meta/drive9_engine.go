@@ -715,6 +715,24 @@ func (m *drive9Meta) Open(ctx Context, inode Ino, flags uint32, attr *Attr) sysc
 	return 0
 }
 
+// Create registers the create-time handle too: baseMeta.Create marks the
+// new inode open locally (m.of.Open), and a create whose fd is still open is
+// exactly as un-reclaimable as an explicit Open when another runtime unlinks
+// the name. The kernel's RELEASE for that handle later goes through Close and
+// releases the registration like any other.
+func (m *drive9Meta) Create(ctx Context, parent Ino, name string, mode, cumask uint16, flags uint32, inode *Ino, attr *Attr) syscall.Errno {
+	st := m.baseMeta.Create(ctx, parent, name, mode, cumask, flags, inode, attr)
+	if st != 0 {
+		return st
+	}
+	if inode != nil && *inode != 0 {
+		if st := m.registerOpenRef(ctx, *inode); st != 0 {
+			return st
+		}
+	}
+	return 0
+}
+
 // Close releases the server-side holder when the last local fd for the inode
 // closes. It mirrors baseMeta.Close's body (the last-close fact it needs is
 // not propagated by the base method) and adds the holder release; the
