@@ -709,6 +709,11 @@ func (m *drive9Meta) Open(ctx Context, inode Ino, flags uint32, attr *Attr) sysc
 	// no reclamation benefit.
 	if attr == nil || attr.Typ != TypeDirectory {
 		if st := m.registerOpenRef(ctx, inode); st != 0 {
+			// The caller sees a failed open and will never send the matching
+			// Close, so give back the refcount baseMeta.Open just took;
+			// otherwise the inode stays "open" locally for the session's
+			// lifetime and a later close never reaches the last one.
+			m.of.Close(inode)
 			return st
 		}
 	}
@@ -727,6 +732,9 @@ func (m *drive9Meta) Create(ctx Context, parent Ino, name string, mode, cumask u
 	}
 	if inode != nil && *inode != 0 {
 		if st := m.registerOpenRef(ctx, *inode); st != 0 {
+			// Same refcount compensation as Open: the kernel retries the
+			// create, and a leaked refcount would pin the node open locally.
+			m.of.Close(*inode)
 			return st
 		}
 	}
@@ -740,15 +748,14 @@ func (m *drive9Meta) Create(ctx Context, parent Ino, name string, mode, cumask u
 // upstream close behavior even if a path ever skips the registration.
 func (m *drive9Meta) Close(ctx Context, inode Ino) syscall.Errno {
 	if m.of.Close(inode) {
+		// baseMeta.Close sends delete_sustained here for inodes it recorded
+		// in removedFiles (unlinked while this session held them open). For
+		// this engine the registered-holder release below is a superset — any
+		// fd that made an unlink defer also registered a holder row on its
+		// Open — so the bookkeeping is kept but the duplicate RPC is not.
 		m.Lock()
-		_, removed := m.removedFiles[inode]
-		if removed {
-			delete(m.removedFiles, inode)
-		}
+		delete(m.removedFiles, inode)
 		m.Unlock()
-		if removed {
-			_ = m.doDeleteSustainedInode(m.sid, inode)
-		}
 		m.releaseOpenRef(ctx, inode)
 	}
 	return 0
@@ -760,6 +767,12 @@ func (m *drive9Meta) Close(ctx Context, inode Ino) syscall.Errno {
 // visible when Unlink decides, or the node is already gone and the ENOENT
 // fails the Open.
 func (m *drive9Meta) registerOpenRef(ctx Context, inode Ino) syscall.Errno {
+	// The map is consulted under the same mutex releaseOpenRef holds across
+	// its delete RPC: a registration racing a last-close release either
+	// waits for the release to finish (entry gone — send the RPC) or runs
+	// before it (entry present — the release's IsOpen re-check will see this
+	// fd and abort). Skipping on a stale entry while the delete is in flight
+	// is the one interleaving that leaves a live fd unprotected.
 	m.openRefsMu.Lock()
 	registered := m.openRefs[inode]
 	m.openRefsMu.Unlock()
@@ -780,24 +793,36 @@ func (m *drive9Meta) registerOpenRef(ctx Context, inode Ino) syscall.Errno {
 	return 0
 }
 
-// releaseOpenRef drops the holder row on last close. Best-effort: on failure
-// the row stays and the data is simply reclaimed later (next close of a
-// reopened fd, or the stale-session sweep), which is the safe direction —
-// never a premature reclaim.
+// releaseOpenRef drops the holder row on last close.
+//
+// The mutex is held across the RPC, and registerOpenRef decides under the same
+// mutex: without that pairing, a concurrent Open of the same inode (the kernel
+// does not serialize one fd's RELEASE against another thread's open) could
+// find the still-present openRefs entry, skip its own registration, and race
+// this delete — leaving a live handle with no holder row, which is exactly the
+// premature-reclaim window Open registration exists to close. With the mutex,
+// the release finishes first and the new open re-registers, or the IsOpen
+// re-check below sees the new fd and aborts the release.
+//
+// Best-effort: on failure the row stays and the data is simply reclaimed later
+// (the next close of a reopened fd, or the stale-session sweep), which is the
+// safe direction — never a premature reclaim.
 func (m *drive9Meta) releaseOpenRef(ctx Context, inode Ino) {
 	m.openRefsMu.Lock()
-	registered := m.openRefs[inode]
-	m.openRefsMu.Unlock()
-	if !registered {
+	defer m.openRefsMu.Unlock()
+	if !m.openRefs[inode] {
+		return
+	}
+	if m.of.IsOpen(inode) {
+		// A new fd appeared between the last-close decision and here; it
+		// re-registered (or is waiting on this mutex to), so keep the row.
 		return
 	}
 	if err := m.doDeleteSustainedInode(m.sid, inode); err != nil {
 		logger.Warnf("release open holder for inode %d: %s", inode, err)
 		return
 	}
-	m.openRefsMu.Lock()
 	delete(m.openRefs, inode)
-	m.openRefsMu.Unlock()
 }
 
 func (m *drive9Meta) doDeleteSustainedInode(sid uint64, inode Ino) error {
