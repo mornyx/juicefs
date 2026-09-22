@@ -37,3 +37,29 @@ func TestWriteBackUsesRemainingHandleAfterRelease(t *testing.T) {
 		t.Fatalf("WriteBack data not visible on remaining handle")
 	}
 }
+
+func TestAbortDropsBufferedWriteWithoutPublishing(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	ctx := NewLogContext(meta.Background())
+	fe, fh, e := v.Create(ctx, 1, "discard.bin", 0644, 0, syscall.O_RDWR)
+	if e != 0 {
+		t.Fatalf("create: %s", e)
+	}
+	payload := bytes.Repeat([]byte{0xA5}, 4096)
+	if e = v.Write(ctx, fe.Inode, payload, 0, fh); e != 0 {
+		t.Fatalf("write: %s", e)
+	}
+
+	v.Abort(ctx, fe.Inode, fh)
+	if v.findHandle(fe.Inode, fh) != nil {
+		t.Fatal("aborted handle was not released")
+	}
+
+	got, e := v.GetAttr(ctx, fe.Inode, 0)
+	if e != 0 {
+		t.Fatalf("getattr: %s", e)
+	}
+	if got.Attr.Length != 0 {
+		t.Fatalf("length after abort = %d, want 0", got.Attr.Length)
+	}
+}
