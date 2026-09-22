@@ -39,6 +39,7 @@ type FileWriter interface {
 	Write(ctx meta.Context, offset uint64, data []byte) syscall.Errno
 	Flush(ctx meta.Context) syscall.Errno
 	Close(ctx meta.Context) syscall.Errno
+	Abort()
 	GetLength() uint64
 	Truncate(length uint64)
 }
@@ -316,12 +317,25 @@ func (c *chunkWriter) commitThread() {
 		flushWaiting := f.flushwaiting > 0
 		f.Unlock()
 
-		if err == 0 {
+		f.commitMu.Lock()
+		f.Lock()
+		aborted := f.aborted
+		f.Unlock()
+		if aborted {
+			for _, it := range items {
+				if it != nil && it.writer != nil {
+					it.writer.Abort()
+				}
+			}
+		} else if err == 0 {
 			err = c.commitItems(f, items, flushWaiting)
 		}
+		f.commitMu.Unlock()
 
 		f.Lock()
-		if err != 0 {
+		if aborted {
+			err = 0
+		} else if err != 0 {
 			if err == syscall.ENOENT || err == syscall.ENOSPC || err == syscall.EDQUOT {
 				for _, it := range items {
 					id, length := it.id, int(it.length)
@@ -424,11 +438,15 @@ func (c *chunkWriter) pickCommitCount() int {
 type fileWriter struct {
 	sync.Mutex
 	w *dataWriter
+	// commitMu serializes metadata commits with Abort. Once Abort returns,
+	// no buffered slice can become visible through metadata.
+	commitMu sync.Mutex
 
 	inode        Ino
 	length       uint64
 	tierID       uint8
 	err          syscall.Errno
+	aborted      bool
 	flushwaiting uint16
 	writewaiting uint16
 	refs         uint16
@@ -641,6 +659,9 @@ func (f *fileWriter) Write(ctx meta.Context, off uint64, data []byte) syscall.Er
 	s := time.Now()
 	f.Lock()
 	defer f.Unlock()
+	if f.aborted {
+		return syscall.EIO
+	}
 	size := uint64(len(data))
 	f.writewaiting++
 	for f.flushwaiting > 0 {
@@ -686,6 +707,9 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 	s := time.Now()
 	f.Lock()
 	defer f.Unlock()
+	if f.aborted {
+		return syscall.EIO
+	}
 	f.flushwaiting++
 
 	var err syscall.Errno
@@ -746,6 +770,40 @@ func (f *fileWriter) Flush(ctx meta.Context) syscall.Errno {
 func (f *fileWriter) Close(ctx meta.Context) syscall.Errno {
 	defer f.w.free(f)
 	return f.Flush(ctx)
+}
+
+// Abort discards buffered writes without committing them to metadata. Close
+// cannot be used for this purpose because it flushes first.
+func (f *fileWriter) Abort() {
+	defer f.w.free(f)
+
+	f.commitMu.Lock()
+	f.Lock()
+	if !f.aborted {
+		f.aborted = true
+		for _, c := range f.chunks {
+			for _, s := range c.slices {
+				s.err = syscall.ECANCELED
+				if !s.freezed {
+					s.freezed = true
+					if s.writer != nil {
+						s.writer.Abort()
+					}
+					s.done = true
+					s.notify.Signal()
+				}
+			}
+		}
+		f.commitcond.Broadcast()
+	}
+	f.Unlock()
+	f.commitMu.Unlock()
+
+	f.Lock()
+	for len(f.chunks) > 0 {
+		f.flushcond.WaitWithTimeout(time.Millisecond * 100)
+	}
+	f.Unlock()
 }
 
 func (f *fileWriter) GetLength() uint64 {

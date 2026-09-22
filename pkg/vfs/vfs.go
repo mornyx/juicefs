@@ -687,6 +687,45 @@ func (v *VFS) Release(ctx Context, ino Ino, fh uint64) {
 	}
 }
 
+// Abort releases a file handle without flushing its buffered writer. It is
+// for callers that already reported a write failure and must not let the final
+// close publish data behind that failure.
+func (v *VFS) Abort(ctx Context, ino Ino, fh uint64) {
+	var err syscall.Errno
+	defer func() { logit(ctx, "abort", err, "(%d,%d)", ino, fh) }()
+	if IsSpecialNode(ino) {
+		v.releaseHandle(ino, fh)
+		return
+	}
+	if fh == 0 {
+		return
+	}
+	f := v.findHandle(ino, fh)
+	if f == nil {
+		return
+	}
+	f.Lock()
+	for (f.writing | f.writers | f.readers) != 0 {
+		if f.cond.WaitWithTimeout(time.Second) && ctx.Canceled() {
+			f.Unlock()
+			err = syscall.EINTR
+			return
+		}
+	}
+	locks := f.locks
+	fowner := f.flockOwner
+	powner := f.ofdOwner
+	f.Unlock()
+	if locks&1 != 0 {
+		_ = v.Meta.Flock(ctx, ino, fowner^fh, F_UNLCK, false)
+	}
+	if locks&2 != 0 && powner != 0 {
+		_ = v.Meta.Setlk(ctx, ino, powner, false, F_UNLCK, 0, 0x7FFFFFFFFFFFFFFF, 0)
+	}
+	_ = v.Meta.Close(ctx, ino)
+	v.abortFileHandle(ino, fh)
+}
+
 func hasReadPerm(flag uint32) bool {
 	return (flag & O_ACCMODE) != syscall.O_WRONLY
 }

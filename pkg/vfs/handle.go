@@ -159,6 +159,17 @@ func (h *handle) Close() {
 	}
 }
 
+func (h *handle) Abort() {
+	if h.reader != nil {
+		h.reader.Close(meta.Background())
+		h.reader = nil
+	}
+	if h.writer != nil {
+		h.writer.Abort()
+		h.writer = nil
+	}
+}
+
 func (v *VFS) newHandle(inode Ino, readOnly bool, tierID uint8) *handle {
 	v.hanleM.Lock()
 	defer v.hanleM.Unlock()
@@ -262,6 +273,19 @@ func (v *VFS) releaseFileHandle(ino Ino, fh uint64) {
 		}
 		h.Unlock()
 		h.Close()
+	}
+}
+
+func (v *VFS) abortFileHandle(ino Ino, fh uint64) {
+	h := v.findHandle(ino, fh)
+	if h != nil {
+		v.releaseHandle(ino, fh)
+		h.Lock()
+		for (h.writing | h.writers | h.readers) != 0 {
+			h.cond.WaitWithTimeout(time.Millisecond * 100)
+		}
+		h.Unlock()
+		h.Abort()
 	}
 }
 
